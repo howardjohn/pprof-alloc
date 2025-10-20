@@ -1,0 +1,16 @@
+[package]
+name = "pprof-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+crossbeam = "0.8"
+backtrace = "0.3"
+pprof = "0.11"
+
+[[example]]
+name = "allocation_patterns"
+path = "examples/allocation_patterns.rs"
