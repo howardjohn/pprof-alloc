@@ -62,7 +62,6 @@ unsafe impl GlobalAlloc for PprofAlloc {
             return self.inner.alloc(layout);
         }
         enter_alloc(|| {
-            let size = layout.size();
             let ptr = self.inner.alloc(layout);
             if !ptr.is_null() {
                 record_allocation(layout.size());
@@ -85,7 +84,7 @@ pub fn malloc_info() -> Result<Malloc, Error> {
 }
 
 fn record_allocation(size: usize) {
-    let (id, name) = thread_id();
+    // let (id, name) = thread_id();
     // println!("Allocating {} bytes [thread {} ({})]", size, id, name);
 
     let trace = crate::bt::HashedBacktrace::capture();
