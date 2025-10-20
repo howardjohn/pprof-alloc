@@ -1,3 +1,102 @@
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[global_allocator]
+static GLOBAL: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new();
+
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name_fn(|| {
+            static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
+            format!("test-{id}")
+        })
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::task::spawn(main_inner()).await.unwrap();
+    });
+}
+
+async fn main_inner() {
+    println!("Starting allocation patterns example...");
+
+    // 1. Small vector allocations
+    println!("1. Allocating small vectors...");
+    let _vectors = allocation_helpers::allocate_small_vectors();
+
+    // 2. Large buffer allocation
+    println!("2. Allocating large buffer...");
+    let _large_buffer = allocation_helpers::allocate_large_buffer();
+
+    // 3. String allocations
+    println!("3. Allocating string data...");
+    let _string_data = allocation_helpers::allocate_string_data();
+
+    // 4. Nested structure allocations
+    println!("4. Allocating nested structures...");
+    let _nested = allocation_helpers::allocate_nested_structures();
+
+    // 5. Immediate allocations and frees
+    println!("5. Immediate allocate and free pattern...");
+    for _ in 0..10 {
+        allocation_helpers::allocate_and_immediately_free();
+    }
+
+    // 6. Recursive allocations
+    println!("6. Recursive allocations...");
+    let _recursive_data = recursive_allocations::recursive_allocation(10);
+    let _fib_sequence = recursive_allocations::fibonacci_allocation(20);
+
+    // 7. Concurrent allocations
+    println!("7. Concurrent allocations...");
+    concurrent_allocations::spawn_allocation_threads();
+
+    // 8. Memory pressure simulation
+    println!("8. Memory pressure simulation...");
+    memory_pressure::simulate_memory_pressure();
+
+    // 9. Mixed allocation patterns
+    println!("9. Mixed allocation patterns...");
+    mixed_allocation_patterns();
+
+    // 10. Long-lived allocations
+    println!("10. Long-lived allocations...");
+    let _long_lived = create_long_lived_allocations();
+
+    // 11. Async allocations
+    println!("11. Async allocations...");
+    async_allocations().await;
+
+    // 12. Box, Rc, Arc allocations
+    println!("12. Smart pointer allocations...");
+    smart_pointer_allocations();
+
+    // 13. Nested call stacks
+    println!("13. Nested call stacks...");
+    nested_call_stacks();
+
+    // 14. Varied size allocations
+    println!("14. Varied size allocations...");
+    varied_size_allocations();
+
+    // 15. Spawned task allocations
+    println!("15. Spawned task allocations...");
+    spawned_task_allocations().await;
+
+    println!("{:#?}", pprof_alloc::malloc_info());
+
+    let by = pprof_alloc::generate_pprof().unwrap();
+    fs::write("/tmp/pprof.memprof", by).unwrap();
+    println!("Wrote /tmp/pprof.memprof");
+
+    println!("Allocation patterns example completed.");
+    println!("Press Enter to exit (keeping some allocations alive)...");
+    let _ = std::io::stdin().read_line(&mut String::new());
+}
+
 mod allocation_helpers {
     use std::collections::HashMap;
 
@@ -151,78 +250,6 @@ mod memory_pressure {
         // Only free some of it
         data.truncate(10);
     }
-}
-
-#[tokio::main]
-async fn main() {
-    println!("Starting allocation patterns example...");
-
-    // 1. Small vector allocations
-    println!("1. Allocating small vectors...");
-    let _vectors = allocation_helpers::allocate_small_vectors();
-
-    // 2. Large buffer allocation
-    println!("2. Allocating large buffer...");
-    let _large_buffer = allocation_helpers::allocate_large_buffer();
-
-    // 3. String allocations
-    println!("3. Allocating string data...");
-    let _string_data = allocation_helpers::allocate_string_data();
-
-    // 4. Nested structure allocations
-    println!("4. Allocating nested structures...");
-    let _nested = allocation_helpers::allocate_nested_structures();
-
-    // 5. Immediate allocations and frees
-    println!("5. Immediate allocate and free pattern...");
-    for _ in 0..10 {
-        allocation_helpers::allocate_and_immediately_free();
-    }
-
-    // 6. Recursive allocations
-    println!("6. Recursive allocations...");
-    let _recursive_data = recursive_allocations::recursive_allocation(10);
-    let _fib_sequence = recursive_allocations::fibonacci_allocation(20);
-
-    // 7. Concurrent allocations
-    println!("7. Concurrent allocations...");
-    concurrent_allocations::spawn_allocation_threads();
-
-    // 8. Memory pressure simulation
-    println!("8. Memory pressure simulation...");
-    memory_pressure::simulate_memory_pressure();
-
-    // 9. Mixed allocation patterns
-    println!("9. Mixed allocation patterns...");
-    mixed_allocation_patterns();
-
-    // 10. Long-lived allocations
-    println!("10. Long-lived allocations...");
-    let _long_lived = create_long_lived_allocations();
-
-    // 11. Async allocations
-    println!("11. Async allocations...");
-    async_allocations().await;
-
-    // 12. Box, Rc, Arc allocations
-    println!("12. Smart pointer allocations...");
-    smart_pointer_allocations();
-
-    // 13. Nested call stacks
-    println!("13. Nested call stacks...");
-    nested_call_stacks();
-
-    // 14. Varied size allocations
-    println!("14. Varied size allocations...");
-    varied_size_allocations();
-
-    // 15. Spawned task allocations
-    println!("15. Spawned task allocations...");
-    spawned_task_allocations().await;
-
-    println!("Allocation patterns example completed.");
-    println!("Press Enter to exit (keeping some allocations alive)...");
-    let _ = std::io::stdin().read_line(&mut String::new());
 }
 
 fn mixed_allocation_patterns() {
