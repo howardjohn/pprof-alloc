@@ -54,10 +54,6 @@ async fn main_inner() {
     println!("7. Concurrent allocations...");
     concurrent_allocations::spawn_allocation_threads();
 
-    // 8. Memory pressure simulation
-    println!("8. Memory pressure simulation...");
-    memory_pressure::simulate_memory_pressure();
-
     // 9. Mixed allocation patterns
     println!("9. Mixed allocation patterns...");
     mixed_allocation_patterns();
@@ -204,51 +200,6 @@ mod concurrent_allocations {
 
             thread::sleep(Duration::from_millis(10));
         }
-    }
-}
-
-mod memory_pressure {
-    use rand::Rng;
-
-    pub fn simulate_memory_pressure() {
-        let mut allocations = Vec::new();
-        let mut rng = rand::thread_rng();
-
-        // Random allocation pattern
-        for _ in 0..100 {
-            let size = rng.gen_range(100..=10000);
-            allocations.push(vec![0u8; size]);
-        }
-
-        // Free some allocations
-        for _ in 0..50 {
-            if !allocations.is_empty() {
-                allocations.pop();
-            }
-        }
-
-        // Allocate more
-        for _ in 0..75 {
-            let size = rng.gen_range(500..=5000);
-            let random_bytes: Vec<u8> = (0..size).map(|_| rng.gen_range(0..=255)).collect();
-            allocations.push(random_bytes);
-        }
-    }
-
-    pub fn allocate_and_leak_some() {
-        let mut data = Vec::new();
-
-        // Create some data that will be "leaked" (not freed until end of function)
-        for i in 0..20 {
-            let chunk: Vec<i32> = (0..1000).map(|j| i * j).collect();
-            data.push(chunk);
-        }
-
-        // Simulate some work
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Only free some of it
-        data.truncate(10);
     }
 }
 

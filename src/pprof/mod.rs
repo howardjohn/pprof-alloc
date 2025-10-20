@@ -18,9 +18,6 @@ use prost::Message;
 pub use cast::CastFrom;
 pub use cast::TryCastFrom;
 
-#[cfg(feature = "flamegraph")]
-pub use inferno::flamegraph::Options as FlamegraphOptions;
-
 /// Start times of the profiler.
 #[derive(Copy, Clone, Debug)]
 pub enum ProfStartTime {
@@ -164,7 +161,6 @@ impl StackProfile {
         }
 
         let mut location_ids = BTreeMap::new();
-        #[cfg(feature = "symbolize")]
         let mut function_ids = BTreeMap::new();
         for (stack, anno) in self.iter() {
             let mut sample = proto::Sample::default();
@@ -207,14 +203,13 @@ impl StackProfile {
                     // insists that location ids are sequential, starting with 1.
                     let id = u64::cast_from(profile.location.len()) + 1;
 
-                    #[allow(unused_mut)] // for feature = "symbolize"
                     let mut mapping =
                         mapping_info.and_then(|(idx, _)| profile.mapping.get_mut(idx));
 
                     // If online symbolization is enabled, resolve the function and line.
                     #[allow(unused_mut)]
                     let mut line = Vec::new();
-                    #[cfg(feature = "symbolize")]
+
                     backtrace::resolve(addr as *mut std::ffi::c_void, |symbol| {
                         let Some(symbol_name) = symbol.name() else {
                             return;
@@ -285,53 +280,6 @@ impl StackProfile {
         profile.string_table = strings.finish();
 
         profile
-    }
-
-    /// Converts the profile into a flamegraph SVG, using the given options.
-    #[cfg(feature = "flamegraph")]
-    pub fn to_flamegraph(&self, opts: &mut FlamegraphOptions) -> anyhow::Result<Vec<u8>> {
-        use std::collections::HashMap;
-
-        // We start from a symbolized Protobuf profile. We just pass in empty type names, since
-        // they're not used in the final flamegraph.
-        let profile = self.to_pprof_proto(("", ""), ("", ""), None);
-
-        // Index locations, functions, and strings.
-        let locations: HashMap<u64, proto::Location> =
-            profile.location.into_iter().map(|l| (l.id, l)).collect();
-        let functions: HashMap<u64, proto::Function> =
-            profile.function.into_iter().map(|f| (f.id, f)).collect();
-        let strings = profile.string_table;
-
-        // Resolve stacks as function name vectors, and sum sample values per stack. Also reverse
-        // the stack, since inferno expects it bottom-up.
-        let mut stacks: HashMap<Vec<&str>, i64> = HashMap::new();
-        for sample in profile.sample {
-            let mut stack = Vec::with_capacity(sample.location_id.len());
-            for location in sample.location_id.into_iter().rev() {
-                let location = locations.get(&location).expect("missing location");
-                for line in location.line.iter().rev() {
-                    let function = functions.get(&line.function_id).expect("missing function");
-                    let name = strings.get(function.name as usize).expect("missing string");
-                    stack.push(name.as_str());
-                }
-            }
-            let value = sample.value.first().expect("missing value");
-            *stacks.entry(stack).or_default() += value;
-        }
-
-        // Construct stack lines for inferno.
-        let mut lines = stacks
-            .into_iter()
-            .map(|(stack, value)| format!("{} {}", stack.join(";"), value))
-            .collect::<Vec<_>>();
-        lines.sort();
-
-        // Generate the flamegraph SVG.
-        let mut bytes = Vec::new();
-        let lines = lines.iter().map(|line| line.as_str());
-        inferno::flamegraph::from_lines(opts, lines, &mut bytes)?;
-        Ok(bytes)
     }
 }
 
@@ -453,13 +401,6 @@ pub fn parse_jeheap_with_mappings<R: BufRead>(
                 let ratio = (bytes_in_sampled_objs / n_objs) / sampling_rate;
                 let scale_factor = 1.0 / (1.0 - (-ratio).exp());
                 let weight = bytes_in_sampled_objs * scale_factor;
-                println!(
-                    "howardjohn: push stack {:?}",
-                    WeightedStack {
-                        addrs: addrs.clone(),
-                        weight
-                    }
-                );
                 profile.push_stack(WeightedStack { addrs, weight }, None);
             }
         }

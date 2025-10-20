@@ -113,12 +113,11 @@ pub fn generate_pprof() -> anyhow::Result<Vec<u8>>  {
     IN_ALLOC.with(|x| x.set(true));
     let mut s = String::new();
     s.push_str("heap_v2/1\n");
+    s.push_str("  t*: 1: 100 [0: 0");
     for mut entry in TRACE_MAP.iter_mut() {
         s.push_str(&format!("@ {:?}\n", entry.backtrace));
-        s.push_str(&format!("t*: {}: {} [0: 0]\n", entry.allocations, entry.allocated));
+        s.push_str(&format!("  t*: {}: {} [0: 0]\n", entry.allocations, entry.allocated));
     }
-    eprintln!("{s}");
-    eprintln!("HELLO");
     IN_ALLOC.with(|x| x.set(false));
     let profile = pprof::parse_jeheap(Cursor::new(s))?;
     let pprof = profile.to_pprof(("inuse_space", "bytes"), ("space", "bytes"), None);
