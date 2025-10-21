@@ -84,6 +84,8 @@ async fn main_inner() {
 
     println!("{:#?}", pprof_alloc::malloc_info());
 
+    drop(_large_buffer);
+    pprof_alloc::generate_fragmentation_map().unwrap();
     let by = pprof_alloc::generate_pprof().unwrap();
     fs::write("/tmp/pprof.memprof", by).unwrap();
     println!("Wrote /tmp/pprof.memprof");
