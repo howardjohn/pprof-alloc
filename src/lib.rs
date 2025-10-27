@@ -1,5 +1,6 @@
 mod pprof;
 mod trace;
+pub mod stats;
 
 use crate::pprof::{StackProfile, WeightedStack};
 use crate::trace::HashedBacktrace;
@@ -50,11 +51,27 @@ impl<V> TheadMap<V> {
 
 pub struct PprofAlloc {
     inner: System,
+    /// Enable profiling support
+    pprof: bool,
+    /// Enable coarse grained stats
+    stats: bool,
 }
 
 impl PprofAlloc {
     pub const fn new() -> Self {
-        PprofAlloc { inner: System }
+        PprofAlloc {
+            inner: System,
+            pprof: false,
+            stats: false,
+        }
+    }
+    pub const fn with_pprof(mut self) -> Self {
+        self.pprof = true;
+        self
+    }
+    pub const fn with_stats(mut self) -> Self {
+        self.stats = true;
+        self
     }
 }
 
@@ -66,6 +83,7 @@ fn enter_alloc<T>(func: impl FnOnce() -> T) -> T {
     output
 }
 
+
 /// next thread id incrementor
 static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
@@ -74,6 +92,7 @@ thread_local! {
     /// Used to avoid recursive alloc/dealloc calls for interior allocation
     static IN_ALLOC: Cell<bool> = Cell::new(false);
 }
+static GLOBAL_STATS: stats::AtomicAllocations = stats::AtomicAllocations::new();
 
 lazy_static::lazy_static! {
     /// pointer -> size
@@ -82,11 +101,10 @@ lazy_static::lazy_static! {
     // backtrace -> current allocation size
     static ref TRACE_MAP: TheadMap<TraceInfo> = TheadMap::new(64);
 }
+
 pub struct TraceInfo {
     pub backtrace: HashedBacktrace,
-    pub allocated: u64,
-    pub freed: u64,
-    pub allocations: u64,
+    pub stats: stats::Allocations,
 }
 
 fn thread_id() -> (usize) {
@@ -108,7 +126,7 @@ unsafe impl GlobalAlloc for PprofAlloc {
         enter_alloc(|| {
             let ptr = self.inner.alloc(layout);
             if !ptr.is_null() {
-                record_allocation(ptr as usize, layout.size());
+                self.record_allocation(ptr as usize, layout.size());
             }
             ptr
         })
@@ -121,7 +139,7 @@ unsafe impl GlobalAlloc for PprofAlloc {
         }
         enter_alloc(|| {
             self.inner.dealloc(ptr, layout);
-            record_deallocation(ptr as usize, layout.size());
+            self.record_deallocation(ptr as usize, layout.size());
         });
     }
 }
@@ -133,40 +151,51 @@ pub fn malloc_info() -> Result<Malloc, Error> {
     malloc_info::malloc_info()
 }
 
-fn record_allocation(start: usize, size: usize) {
-    let (id) = thread_id();
-    // println!("Allocating {} bytes [thread {} ({})]", size, id, name);
+impl PprofAlloc {
+    fn record_allocation(&self, start: usize, size: usize) {
+        let (id) = thread_id();
 
-    let trace = crate::trace::HashedBacktrace::capture();
+        if self.stats {
+            GLOBAL_STATS.allocated.fetch_add(size as u64, Ordering::Relaxed);
+            GLOBAL_STATS.allocations.fetch_add(1, Ordering::Relaxed);
+        }
 
-    // POINTER_MAP.entry(start).insert(size);
-    // LEAKY_POINTER_MAP.entry(start).insert(size);
+        if self.pprof {
+            let trace = crate::trace::HashedBacktrace::capture();
 
-    TRACE_MAP.update(
-        id,
-        trace.hash(),
-        || TraceInfo {
-            backtrace: trace,
-            allocated: 0,
-            freed: 0,
-            allocations: 0,
-        },
-        |i| {
-            i.allocated += size as u64;
-            i.allocations += 1;
-        },
-    );
-    // let bt = Backtrace::new();
-    // let key = format!("{:?}", bt);
-    // let mut map = ALLOCATIONS.lock().unwrap();
-    // *map.entry(key).or_insert(0) += size;
+            // POINTER_MAP.entry(start).insert(size);
+            // LEAKY_POINTER_MAP.entry(start).insert(size);
+
+            TRACE_MAP.update(
+                id,
+                trace.hash(),
+                || TraceInfo {
+                    backtrace: trace,
+                    stats: Default::default(),
+                },
+                |i| {
+                    i.stats.allocated += size as u64;
+                    i.stats.allocations += 1;
+                },
+            );
+        }
+        // let bt = Backtrace::new();
+        // let key = format!("{:?}", bt);
+        // let mut map = ALLOCATIONS.lock().unwrap();
+        // *map.entry(key).or_insert(0) += size;
+    }
+
+    fn record_deallocation(&self, start: usize, size: usize) {
+        if self.stats {
+            GLOBAL_STATS.freed.fetch_add(size as u64, Ordering::Relaxed);
+            GLOBAL_STATS.frees.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+        POINTER_MAP.remove(&start);
+        // TODO: TRACE_MAP
+    }
+
 }
-
-fn record_deallocation(start: usize, size: usize) {
-    POINTER_MAP.remove(&start);
-    // TODO: TRACE_MAP
-}
-
 pub fn generate_fragmentation_map() -> anyhow::Result<()> {
     IN_ALLOC.with(|x| x.set(true));
     let MinMaxResult::MinMax(min, max) = LEAKY_POINTER_MAP.iter().map(|x| *x.key()).minmax() else {
@@ -308,7 +337,7 @@ pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
     // let sampling_rate: f64 = 1.0;
     TRACE_MAP.iter(|entry| {
         let addrs = entry.backtrace.addrs();
-        let weight = entry.allocated as f64;
+        let weight = entry.stats.allocated as f64;
         profile.push_stack(WeightedStack { addrs, weight }, None);
     });
     IN_ALLOC.with(|x| x.set(false));

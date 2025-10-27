@@ -22,7 +22,7 @@ fn main() {
 
 async fn main_inner() {
     println!("Starting allocation patterns example...");
-
+    println!("cgroup memory: {:?}", pprof_alloc::stats::cgroups::get_memory());
     // 1. Small vector allocations
     println!("1. Allocating small vectors...");
     let _vectors = allocation_helpers::allocate_small_vectors();
@@ -85,13 +85,15 @@ async fn main_inner() {
     println!("{:#?}", pprof_alloc::malloc_info());
 
     drop(_large_buffer);
-    pprof_alloc::generate_fragmentation_map().unwrap();
+    // pprof_alloc::generate_fragmentation_map().unwrap();
     let by = pprof_alloc::generate_pprof().unwrap();
     fs::write("/tmp/pprof.memprof", by).unwrap();
     println!("Wrote /tmp/pprof.memprof");
 
     println!("Allocation patterns example completed.");
     println!("Press Enter to exit (keeping some allocations alive)...");
+    println!("cgroup memory: {:?}", pprof_alloc::stats::cgroups::get_memory());
+    println!("cgroup memory: {:?}", pprof_alloc::stats::smaps::rollup());
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 

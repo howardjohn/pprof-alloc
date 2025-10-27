@@ -35,6 +35,8 @@ hopframe = "0.2.0"
 prehash = "1.0.0"
 parking_lot = "0.12.5"
 ahash = "0.8.12"
+regex = "1.12.2"
+procsmaps = "0.1.2"
 
 [[example]]
 name = "allocation_patterns"
