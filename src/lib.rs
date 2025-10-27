@@ -1,16 +1,15 @@
-mod bt;
 mod pprof;
+mod trace;
 
-use crate::bt::TraceInfo;
-use backtrace::Backtrace;
+use crate::pprof::{StackProfile, WeightedStack};
+use crate::trace::HashedBacktrace;
 use dashmap::DashMap;
 use itertools::{Itertools, MinMaxResult};
-use malloc_info::Error;
 use malloc_info::info::Malloc;
+use malloc_info::Error;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::io::{BufReader, Cursor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -47,6 +46,12 @@ lazy_static::lazy_static! {
     static ref LEAKY_POINTER_MAP: DashMap<usize, usize> = DashMap::new();
     // backtrace -> current allocation size
     static ref TRACE_MAP: DashMap<u64, TraceInfo> = DashMap::new();
+}
+pub struct TraceInfo {
+    pub backtrace: HashedBacktrace,
+    pub allocated: u64,
+    pub freed: u64,
+    pub allocations: u64,
 }
 
 fn thread_id() -> (usize, Arc<str>) {
@@ -93,7 +98,7 @@ fn record_allocation(start: usize, size: usize) {
     // let (id, name) = thread_id();
     // println!("Allocating {} bytes [thread {} ({})]", size, id, name);
 
-    let trace = crate::bt::HashedBacktrace::capture();
+    let trace = crate::trace::HashedBacktrace::capture();
 
     POINTER_MAP.entry(start).insert(size);
     LEAKY_POINTER_MAP.entry(start).insert(size);
@@ -167,17 +172,18 @@ pub fn generate_fragmentation_map() -> anyhow::Result<()> {
         logical_offset += (end - start) as u64;
     }
 
-
     // Process filled ranges
     for (fstart, fend) in &filled_ranges {
         // Find which segment this filled range belongs to
-        if let Some((_, _, log_start)) = segment_map.iter()
-          .find(|(s, e, _)| *fstart as u64 >= *s && (*fend as u64) <= *e) {
-
-            let seg_start = segment_map.iter()
-              .find(|(s, e, _)| *fstart as u64 >= *s && (*fend as u64) <= *e)
-              .map(|(s, _, _)| *s)
-              .unwrap();
+        if let Some((_, _, log_start)) = segment_map
+            .iter()
+            .find(|(s, e, _)| *fstart as u64 >= *s && (*fend as u64) <= *e)
+        {
+            let seg_start = segment_map
+                .iter()
+                .find(|(s, e, _)| *fstart as u64 >= *s && (*fend as u64) <= *e)
+                .map(|(s, _, _)| *s)
+                .unwrap();
 
             // Convert to logical coordinates
             let logical_start = log_start + ((*fstart as u64) - seg_start);
@@ -223,7 +229,8 @@ pub fn generate_fragmentation_map() -> anyhow::Result<()> {
             let shade_idx = if density == 0 {
                 0
             } else {
-                let normalized = (density as f64 / max_density as f64 * (shades.len() - 1) as f64).ceil() as usize;
+                let normalized = (density as f64 / max_density as f64 * (shades.len() - 1) as f64)
+                    .ceil() as usize;
                 normalized.min(shades.len() - 1)
             };
 
@@ -233,7 +240,10 @@ pub fn generate_fragmentation_map() -> anyhow::Result<()> {
     }
     println!("└{}┘", "─".repeat(width));
 
-    println!("\nLegend: {} = empty, {} = partial, {} = full", shades[0], shades[2], shades[4]);
+    println!(
+        "\nLegend: {} = empty, {} = partial, {} = full",
+        shades[0], shades[2], shades[4]
+    );
     println!("\nNote: Each segment from the total space is packed sequentially,");
     println!("      ignoring the gaps between them.");
 
@@ -241,25 +251,22 @@ pub fn generate_fragmentation_map() -> anyhow::Result<()> {
 }
 pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
     IN_ALLOC.with(|x| x.set(true));
-    let mut s = String::new();
-    s.push_str("heap_v2/1\n");
-    s.push_str("  t*: 1: 100 [0: 0");
+    let mut profile = StackProfile {
+        annotations: Default::default(),
+        stacks: Default::default(),
+        mappings: if let Some(m) = crate::pprof::MAPPINGS.as_deref() {
+            m.to_vec()
+        } else {
+            Default::default()
+        },
+    };
+    // let sampling_rate: f64 = 1.0;
     for mut entry in TRACE_MAP.iter_mut() {
-        s.push_str(&format!("@ {:?}\n", entry.backtrace));
-        s.push_str(&format!(
-            "  t*: {}: {} [0: 0]\n",
-            entry.allocations, entry.allocated
-        ));
+        let addrs = entry.backtrace.addrs();
+        let weight = entry.allocated as f64;
+        profile.push_stack(WeightedStack { addrs, weight }, None);
     }
     IN_ALLOC.with(|x| x.set(false));
-    let profile = pprof::parse_jeheap(Cursor::new(s))?;
     let pprof = profile.to_pprof(("inuse_space", "bytes"), ("space", "bytes"), None);
     Ok(pprof)
-    // pprof::parse_jeheap()
-    // Placeholder for generating pprof
-    // println!("Generating pprof...");
-    // let map = ALLOCATIONS.lock().unwrap();
-    // for (stack, size) in map.iter() {
-    //     println!("Stack: {}, Size: {}", stack, size);
-    // }
 }
