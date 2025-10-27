@@ -2,32 +2,11 @@ use smallvec::SmallVec;
 use std::arch::asm;
 use std::cell::RefCell;
 
-thread_local! {
-    static UNWINDER: RefCell<hopframe::unwinder::StackUnwinder>  = RefCell::new(hopframe::unwinder::UnwindBuilder::new().build());
-}
+// With 'tracefp', I see pretty poor performance with unless memory-access-check is disabled
+// hopframe is better, but does more work that isn't really needed
+// This implementation is like tracefp but faster since we don't use libc getcontext and instead just
+// inline the 2 registers we need.
 
-// pub fn trace() -> super::UnresolvedFrames {
-//     let mut bt: SmallVec<[usize; super::SOFT_MAX_DEPTH]> =
-//         SmallVec::with_capacity(super::SOFT_MAX_DEPTH);
-//     UNWINDER.with(|unwinder| {
-//         let mut unwinder = unwinder.borrow_mut();
-//         let i = unwinder.unwind();
-//         i.for_each(|f| bt.push(f.address() as usize))
-//     });
-//     bt.into()
-// // }
-// pub fn trace() -> super::UnresolvedFrames {
-//     let mut bt: SmallVec<[u64; super::SOFT_MAX_DEPTH]> =
-//         SmallVec::with_capacity(super::SOFT_MAX_DEPTH);
-//     // Safety: not sure, it doesn't say why unsynchronized is unsafe. pprof-rs does this...
-//     unsafe {
-//         tracefp::trace(|f| {
-//             bt.push(f);
-//             true
-//         });
-//     }
-//     bt.into()
-// }
 pub fn trace() -> super::UnresolvedFrames {
     let mut bt: SmallVec<[u64; super::SOFT_MAX_DEPTH]> =
         SmallVec::with_capacity(super::SOFT_MAX_DEPTH);

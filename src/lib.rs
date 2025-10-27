@@ -5,13 +5,48 @@ use crate::pprof::{StackProfile, WeightedStack};
 use crate::trace::HashedBacktrace;
 use dashmap::DashMap;
 use itertools::{Itertools, MinMaxResult};
-use malloc_info::info::Malloc;
 use malloc_info::Error;
+use malloc_info::info::Malloc;
+use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+
+struct TheadMap<V> {
+    shards: Box<[Mutex<prehash::PrehashedMap<u64, V>>]>,
+}
+
+impl<V> TheadMap<V> {
+    pub fn new(size: usize) -> Self {
+        Self {
+            shards: (0..size + 1)
+                .map(|_| Mutex::new(prehash::PrehashedMap::<u64, V>::default()))
+                .collect(),
+        }
+    }
+
+    fn update(&self, thread: usize, key: u64, def: impl FnOnce() -> V, apply: impl FnOnce(&mut V)) {
+        // Use actual thread ID as shard
+        let shard_idx = if thread < self.shards.len() {
+            thread
+        } else {
+            self.shards.len() - 1
+        };
+        let k = prehash::Prehashed::new(key, key);
+        let mut l = self.shards[shard_idx].lock();
+        let v = l.entry(k).or_insert_with(def);
+        apply(v);
+    }
+
+    fn iter(&self, mut def: impl FnMut(&V)) {
+        for shard in &self.shards {
+            shard.lock().iter().for_each(|(_, v)| def(v));
+        }
+    }
+}
 
 pub struct PprofAlloc {
     inner: System,
@@ -45,7 +80,7 @@ lazy_static::lazy_static! {
     static ref POINTER_MAP: DashMap<usize, usize> = DashMap::new();
     static ref LEAKY_POINTER_MAP: DashMap<usize, usize> = DashMap::new();
     // backtrace -> current allocation size
-    static ref TRACE_MAP: DashMap<u64, TraceInfo> = DashMap::new();
+    static ref TRACE_MAP: TheadMap<TraceInfo> = TheadMap::new(64);
 }
 pub struct TraceInfo {
     pub backtrace: HashedBacktrace,
@@ -54,7 +89,11 @@ pub struct TraceInfo {
     pub allocations: u64,
 }
 
-fn thread_id() -> (usize, Arc<str>) {
+fn thread_id() -> (usize) {
+    THREAD_ID.with(|id| *id)
+}
+
+fn thread_name() -> (usize, Arc<str>) {
     (
         THREAD_ID.with(|id| *id),
         THREAD_NAME.with(|n| n.clone()).unwrap_or_default(),
@@ -95,22 +134,28 @@ pub fn malloc_info() -> Result<Malloc, Error> {
 }
 
 fn record_allocation(start: usize, size: usize) {
-    // let (id, name) = thread_id();
+    let (id) = thread_id();
     // println!("Allocating {} bytes [thread {} ({})]", size, id, name);
 
     let trace = crate::trace::HashedBacktrace::capture();
 
-    POINTER_MAP.entry(start).insert(size);
-    LEAKY_POINTER_MAP.entry(start).insert(size);
+    // POINTER_MAP.entry(start).insert(size);
+    // LEAKY_POINTER_MAP.entry(start).insert(size);
 
-    let mut trace_info = TRACE_MAP.entry(trace.hash()).or_insert_with(|| TraceInfo {
-        backtrace: trace,
-        allocated: 0,
-        freed: 0,
-        allocations: 0,
-    });
-    trace_info.allocated += size as u64;
-    trace_info.allocations += 1;
+    TRACE_MAP.update(
+        id,
+        trace.hash(),
+        || TraceInfo {
+            backtrace: trace,
+            allocated: 0,
+            freed: 0,
+            allocations: 0,
+        },
+        |i| {
+            i.allocated += size as u64;
+            i.allocations += 1;
+        },
+    );
     // let bt = Backtrace::new();
     // let key = format!("{:?}", bt);
     // let mut map = ALLOCATIONS.lock().unwrap();
@@ -261,11 +306,11 @@ pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
         },
     };
     // let sampling_rate: f64 = 1.0;
-    for mut entry in TRACE_MAP.iter_mut() {
+    TRACE_MAP.iter(|entry| {
         let addrs = entry.backtrace.addrs();
         let weight = entry.allocated as f64;
         profile.push_stack(WeightedStack { addrs, weight }, None);
-    }
+    });
     IN_ALLOC.with(|x| x.set(false));
     let pprof = profile.to_pprof(("inuse_space", "bytes"), ("space", "bytes"), None);
     Ok(pprof)

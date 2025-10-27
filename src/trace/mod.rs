@@ -38,7 +38,7 @@ impl fmt::Debug for HashedBacktrace {
 impl HashedBacktrace {
     pub fn capture() -> Self {
         let bt = trace();
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = ahash::AHasher::default();
         bt.0.iter().for_each(|x| hasher.write_u64(*x));
         let hash = hasher.finish();
         Self { inner: bt, hash }
