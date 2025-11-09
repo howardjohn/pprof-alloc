@@ -15,8 +15,8 @@
 
 //! Cast utilities.
 
-use num::traits::bounds::UpperBounded;
 use num::Signed;
+use num::traits::bounds::UpperBounded;
 use std::error::Error;
 use std::fmt;
 use std::ops::Deref;
@@ -36,82 +36,82 @@ use std::ops::Deref;
 /// [`std::convert::TryFrom`] trait, as `TryFrom` will produce a runtime error,
 /// while `CastFrom` will produce a compile-time error.
 pub trait CastFrom<T> {
-    /// Performs the cast.
-    fn cast_from(from: T) -> Self;
+	/// Performs the cast.
+	fn cast_from(from: T) -> Self;
 }
 
 macro_rules! cast_from {
-    ($from:ty, $to:ty) => {
-        paste::paste! {
-            impl crate::pprof::cast::CastFrom<$from> for $to {
-                #[allow(clippy::as_conversions)]
-                #[allow(unused)]
-                fn cast_from(from: $from) -> $to {
-                    from as $to
-                }
-            }
+	($from:ty, $to:ty) => {
+		paste::paste! {
+				impl crate::pprof::cast::CastFrom<$from> for $to {
+						#[allow(clippy::as_conversions)]
+						#[allow(unused)]
+						fn cast_from(from: $from) -> $to {
+								from as $to
+						}
+				}
 
-            /// Casts [`$from`] to [`$to`].
-            ///
-            /// This is equivalent to the [`crate::cast::CastFrom`] implementation but is
-            /// available as a `const fn`.
-            #[allow(clippy::as_conversions)]
-            #[allow(unused)]
-            pub const fn [< $from _to_ $to >](from: $from) -> $to {
-                from as $to
-            }
-        }
-    };
+				/// Casts [`$from`] to [`$to`].
+				///
+				/// This is equivalent to the [`crate::cast::CastFrom`] implementation but is
+				/// available as a `const fn`.
+				#[allow(clippy::as_conversions)]
+				#[allow(unused)]
+				pub const fn [< $from _to_ $to >](from: $from) -> $to {
+						from as $to
+				}
+		}
+	};
 }
 
 #[cfg(target_pointer_width = "32")]
 /// Safe casts for 32bit platforms
 mod target32 {
-    // size_of<from> < size_of<target>
-    cast_from!(u8, usize);
-    cast_from!(u16, usize);
-    cast_from!(u8, isize);
-    cast_from!(i8, isize);
-    cast_from!(u16, isize);
-    cast_from!(i16, isize);
+	// size_of<from> < size_of<target>
+	cast_from!(u8, usize);
+	cast_from!(u16, usize);
+	cast_from!(u8, isize);
+	cast_from!(i8, isize);
+	cast_from!(u16, isize);
+	cast_from!(i16, isize);
 
-    cast_from!(usize, u64);
-    cast_from!(usize, i64);
-    cast_from!(usize, u128);
-    cast_from!(usize, i128);
-    cast_from!(isize, i64);
-    cast_from!(isize, i128);
+	cast_from!(usize, u64);
+	cast_from!(usize, i64);
+	cast_from!(usize, u128);
+	cast_from!(usize, i128);
+	cast_from!(isize, i64);
+	cast_from!(isize, i128);
 
-    // size_of<from> == size_of<target>
-    cast_from!(usize, u32);
-    cast_from!(isize, i32);
-    cast_from!(u32, usize);
-    cast_from!(i32, isize);
+	// size_of<from> == size_of<target>
+	cast_from!(usize, u32);
+	cast_from!(isize, i32);
+	cast_from!(u32, usize);
+	cast_from!(i32, isize);
 }
 
 #[cfg(target_pointer_width = "64")]
 /// Safe casts for 64bit platforms
 pub mod target64 {
-    // size_of<from> < size_of<target>
-    cast_from!(u8, usize);
-    cast_from!(u16, usize);
-    cast_from!(u32, usize);
-    cast_from!(u8, isize);
-    cast_from!(i8, isize);
-    cast_from!(u16, isize);
-    cast_from!(i16, isize);
-    cast_from!(u32, isize);
-    cast_from!(i32, isize);
+	// size_of<from> < size_of<target>
+	cast_from!(u8, usize);
+	cast_from!(u16, usize);
+	cast_from!(u32, usize);
+	cast_from!(u8, isize);
+	cast_from!(i8, isize);
+	cast_from!(u16, isize);
+	cast_from!(i16, isize);
+	cast_from!(u32, isize);
+	cast_from!(i32, isize);
 
-    cast_from!(usize, u128);
-    cast_from!(usize, i128);
-    cast_from!(isize, i128);
+	cast_from!(usize, u128);
+	cast_from!(usize, i128);
+	cast_from!(isize, i128);
 
-    // size_of<from> == size_of<target>
-    cast_from!(usize, u64);
-    cast_from!(isize, i64);
-    cast_from!(u64, usize);
-    cast_from!(i64, isize);
+	// size_of<from> == size_of<target>
+	cast_from!(usize, u64);
+	cast_from!(isize, i64);
+	cast_from!(u64, usize);
+	cast_from!(i64, isize);
 }
 
 // TODO(petrosagg): remove these once the std From impls become const
@@ -164,28 +164,24 @@ cast_from!(i64, i128);
 /// standard library. For example, `i64::MAX` can be converted to
 /// `f64`, but `i64::MAX - 1` can't.
 pub trait TryCastFrom<T>: Sized {
-    /// Attempts to perform the cast
-    fn try_cast_from(from: T) -> Option<Self>;
+	/// Attempts to perform the cast
+	fn try_cast_from(from: T) -> Option<Self>;
 }
 
 /// Implement `TryCastFrom` for the specified types.
 /// This is only necessary for types for which `as` exists,
 /// but `TryFrom` doesn't (notably floats).
 macro_rules! try_cast_from {
-    ($from:ty, $to:ty) => {
-        impl crate::pprof::cast::TryCastFrom<$from> for $to {
-            #[allow(clippy::as_conversions)]
-            fn try_cast_from(from: $from) -> Option<$to> {
-                let to = from as $to;
-                let inverse = to as $from;
-                if from == inverse {
-                    Some(to)
-                } else {
-                    None
-                }
-            }
-        }
-    };
+	($from:ty, $to:ty) => {
+		impl crate::pprof::cast::TryCastFrom<$from> for $to {
+			#[allow(clippy::as_conversions)]
+			fn try_cast_from(from: $from) -> Option<$to> {
+				let to = from as $to;
+				let inverse = to as $from;
+				if from == inverse { Some(to) } else { None }
+			}
+		}
+	};
 }
 
 try_cast_from!(f64, i64);
@@ -198,68 +194,68 @@ try_cast_from!(u64, f64);
 #[repr(transparent)]
 pub struct NonNeg<T>(T)
 where
-    T: Signed + fmt::Display;
+	T: Signed + fmt::Display;
 
 impl<T> NonNeg<T>
 where
-    T: Signed + fmt::Display,
+	T: Signed + fmt::Display,
 {
-    /// Returns the minimum value of the type.
-    pub fn min() -> NonNeg<T> {
-        NonNeg(T::zero())
-    }
+	/// Returns the minimum value of the type.
+	pub fn min() -> NonNeg<T> {
+		NonNeg(T::zero())
+	}
 
-    /// Returns the maximum value of the type.
-    pub fn max() -> NonNeg<T>
-    where
-        T: UpperBounded,
-    {
-        NonNeg(T::max_value())
-    }
+	/// Returns the maximum value of the type.
+	pub fn max() -> NonNeg<T>
+	where
+		T: UpperBounded,
+	{
+		NonNeg(T::max_value())
+	}
 
-    /// Attempts to construct a `NonNeg` from its underlying type.
-    ///
-    /// Returns an error if `n` is negative.
-    pub fn try_from(n: T) -> Result<NonNeg<T>, NonNegError> {
-        match n.is_negative() {
-            false => Ok(NonNeg(n)),
-            true => Err(NonNegError),
-        }
-    }
+	/// Attempts to construct a `NonNeg` from its underlying type.
+	///
+	/// Returns an error if `n` is negative.
+	pub fn try_from(n: T) -> Result<NonNeg<T>, NonNegError> {
+		match n.is_negative() {
+			false => Ok(NonNeg(n)),
+			true => Err(NonNegError),
+		}
+	}
 }
 
 impl<T> fmt::Display for NonNeg<T>
 where
-    T: Signed + fmt::Display,
+	T: Signed + fmt::Display,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.0.fmt(f)
-    }
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		self.0.fmt(f)
+	}
 }
 
 impl<T> Deref for NonNeg<T>
 where
-    T: Signed + fmt::Display,
+	T: Signed + fmt::Display,
 {
-    type Target = T;
+	type Target = T;
 
-    fn deref(&self) -> &T {
-        &self.0
-    }
+	fn deref(&self) -> &T {
+		&self.0
+	}
 }
 
 impl From<NonNeg<i64>> for u64 {
-    fn from(n: NonNeg<i64>) -> u64 {
-        u64::try_from(*n).expect("non-negative")
-    }
+	fn from(n: NonNeg<i64>) -> u64 {
+		u64::try_from(*n).expect("non-negative")
+	}
 }
 
 #[cfg(target_pointer_width = "64")]
 impl CastFrom<NonNeg<i64>> for usize {
-    #[allow(clippy::as_conversions)]
-    fn cast_from(from: NonNeg<i64>) -> usize {
-        usize::cast_from(u64::from(from))
-    }
+	#[allow(clippy::as_conversions)]
+	fn cast_from(from: NonNeg<i64>) -> usize {
+		usize::cast_from(u64::from(from))
+	}
 }
 
 /// An error indicating the attempted construction of a `NonNeg` with a negative
@@ -268,9 +264,9 @@ impl CastFrom<NonNeg<i64>> for usize {
 pub struct NonNegError;
 
 impl fmt::Display for NonNegError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("cannot construct NonNeg from negative number")
-    }
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.write_str("cannot construct NonNeg from negative number")
+	}
 }
 
 impl Error for NonNegError {}

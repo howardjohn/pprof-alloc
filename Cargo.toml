@@ -15,7 +15,6 @@ serde = { version = "1.0", features = ["derive"] }
 crossbeam = "0.8"
 backtrace = "0.3"
 pprof = "0.11"
-malloc-info = "0.1.2"
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize"] }
 anyhow = "1.0.100"
 flate2 = "1.1.4"
@@ -36,7 +35,11 @@ prehash = "1.0.0"
 parking_lot = "0.12.5"
 ahash = "0.8.12"
 regex = "1.12.2"
-procsmaps = "0.1.2"
+human_bytes = "0.4.3"
+errno = "0.3.14"
+thiserror = "1.0.69"
+quick-xml = { version = "0.38.3", features = ["serialize"] }
+prometheus-client = "0.24.0"
 
 [[example]]
 name = "allocation_patterns"
