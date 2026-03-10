@@ -3,6 +3,7 @@ use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
 use prometheus_client::metrics::gauge::ConstGauge;
 use regex::Regex;
+use serde::Serialize;
 use std::fmt::Error;
 
 lazy_static::lazy_static! {
@@ -48,7 +49,7 @@ pub fn get_stats() -> anyhow::Result<MemoryStat> {
 }
 
 /// A few interesting values from memory.stat
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Serialize)]
 pub struct MemoryStat {
 	pub usage: u64,
 	// https://github.com/google/cadvisor/blob/5adb1c3bb38b4c5d50b31f39faf3214a44ae479b/container/libcontainer/handler.go#L847

@@ -1,11 +1,12 @@
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
 use prometheus_client::metrics::gauge::ConstGauge;
+use serde::Serialize;
 use std::fmt::Error;
 use std::fs::File;
 use std::io::Read;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone, Serialize)]
 pub struct ProcessStats {
 	pub size: u64,
 	pub rss: u64,

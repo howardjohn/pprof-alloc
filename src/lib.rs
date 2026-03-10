@@ -5,10 +5,14 @@ mod trace;
 use crate::pprof::{StackProfile, WeightedStack};
 use crate::trace::HashedBacktrace;
 use dashmap::DashMap;
+use serde::Serialize;
 use smallvec::smallvec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub use crate::trace::CaptureMode;
 
 pub struct PprofAlloc {
 	inner: System,
@@ -36,6 +40,80 @@ impl HeapSampleValues {
 			inuse_space: stats.in_use_bytes() as i64,
 		}
 	}
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Probe<T> {
+	pub value: Option<T>,
+	pub error: Option<String>,
+}
+
+impl<T> Probe<T> {
+	fn ok(value: T) -> Self {
+		Self {
+			value: Some(value),
+			error: None,
+		}
+	}
+
+	fn err(error: impl ToString) -> Self {
+		Self {
+			value: None,
+			error: Some(error.to_string()),
+		}
+	}
+}
+
+impl<T, E> From<Result<T, E>> for Probe<T>
+where
+	E: std::fmt::Display,
+{
+	fn from(result: Result<T, E>) -> Self {
+		match result {
+			Ok(value) => Self::ok(value),
+			Err(error) => Self::err(error),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MallocSummary {
+	pub system_max: u64,
+	pub system_current: u64,
+	pub total: u64,
+	pub heaps: u64,
+}
+
+impl From<&stats::malloc::MallocInfo> for MallocSummary {
+	fn from(info: &stats::malloc::MallocInfo) -> Self {
+		Self {
+			system_max: info.system_max(),
+			system_current: info.system_current(),
+			total: info.total(),
+			heaps: info.heaps(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PprofSummary {
+	pub total_stacks: u64,
+	pub live_stacks: u64,
+	pub alloc_space_bytes: u64,
+	pub inuse_space_bytes: u64,
+	pub alloc_objects: u64,
+	pub inuse_objects: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MemorySnapshot {
+	pub captured_at_unix_ms: u64,
+	pub capture_mode: CaptureMode,
+	pub allocation_stats: stats::Allocations,
+	pub pprof: PprofSummary,
+	pub malloc: Probe<MallocSummary>,
+	pub cgroup: Probe<stats::cgroups::MemoryStat>,
+	pub smaps: Probe<stats::smaps::ProcessStats>,
 }
 
 impl Default for PprofAlloc {
@@ -144,6 +222,43 @@ lazy_static::lazy_static! {
 
 pub fn allocation_stats() -> stats::Allocations {
 	GLOBAL_STATS.snapshot()
+}
+
+pub const fn capture_mode() -> CaptureMode {
+	trace::capture_mode()
+}
+
+pub fn snapshot() -> MemorySnapshot {
+	enter_alloc(|| MemorySnapshot {
+		captured_at_unix_ms: SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("system time must be after the UNIX epoch")
+			.as_millis()
+			.try_into()
+			.expect("timestamp must fit in u64"),
+		capture_mode: capture_mode(),
+		allocation_stats: allocation_stats(),
+		pprof: pprof_summary(),
+		malloc: Probe::from(stats::malloc::info().map(|info| MallocSummary::from(&info))),
+		cgroup: Probe::from(stats::cgroups::get_stats()),
+		smaps: Probe::from(stats::smaps::rollup()),
+	})
+}
+
+fn pprof_summary() -> PprofSummary {
+	let mut summary = PprofSummary::default();
+	for entry in TRACE_MAP.iter() {
+		let stats = entry.value();
+		summary.total_stacks += 1;
+		summary.alloc_space_bytes += stats.allocated;
+		summary.inuse_space_bytes += stats.in_use_bytes();
+		summary.alloc_objects += stats.allocations;
+		summary.inuse_objects += stats.in_use_allocations();
+		if stats.in_use_bytes() > 0 {
+			summary.live_stacks += 1;
+		}
+	}
+	summary
 }
 
 unsafe impl GlobalAlloc for PprofAlloc {
@@ -335,5 +450,32 @@ mod tests {
 		assert_eq!(TRACE_MAP.get(&original_trace).unwrap().in_use_bytes(), 0);
 		assert_eq!(total_live_bytes, 96);
 		assert_eq!(POINTER_MAP.get(&0x4000).unwrap().size, 96);
+	}
+
+	#[test]
+	fn snapshot_reports_current_pprof_summary() {
+		let _guard = TEST_GUARD.lock();
+		reset_tracking_state();
+
+		let alloc = PprofAlloc::new().with_pprof();
+		let trace = HashedBacktrace::capture();
+
+		alloc.record_allocation_with_trace(0x1000, 128, trace.clone());
+		alloc.record_allocation_with_trace(0x2000, 64, trace);
+		alloc.record_deallocation(0x1000, 128);
+
+		let snapshot = snapshot();
+		assert_eq!(snapshot.capture_mode, CaptureMode::FramePointer);
+		assert_eq!(
+			snapshot.pprof,
+			PprofSummary {
+				total_stacks: 1,
+				live_stacks: 1,
+				alloc_space_bytes: 192,
+				inuse_space_bytes: 64,
+				alloc_objects: 2,
+				inuse_objects: 1,
+			}
+		);
 	}
 }

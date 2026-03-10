@@ -55,8 +55,7 @@ The current crate has three main pieces:
 1. Allocation tracing
 
 - `PprofAlloc` wraps the global allocator and records backtraces on allocation.
-- By default, stack capture uses `backtrace::trace_unsynchronized`.
-- With the `frame-pointer` feature, stack capture uses a manual frame-pointer walk.
+- Stack capture uses a manual frame-pointer walk.
 
 2. pprof export
 
@@ -94,6 +93,13 @@ let cgroup = pprof_alloc::stats::cgroups::get_stats()?;
 let smaps = pprof_alloc::stats::smaps::rollup()?;
 ```
 
+Capture one combined snapshot for a JSON/debug endpoint:
+
+```rust
+let snapshot = pprof_alloc::snapshot();
+let json = serde_json::to_string_pretty(&snapshot)?;
+```
+
 Register Prometheus collectors:
 
 ```rust
@@ -111,16 +117,33 @@ cargo run --example allocation_patterns
 
 ## Frame-pointer mode
 
-Frame-pointer unwinding is behind the `frame-pointer` feature and requires frame pointers to be preserved:
+Frame-pointer unwinding requires frame pointers to be preserved:
 
 ```bash
-RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --features frame-pointer --example allocation_patterns
+RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --example allocation_patterns
 ```
 
 Current caveats:
 
+- This is the intended fast path for stack capture.
 - The frame-pointer unwinder is architecture-specific.
 - It assumes a valid frame-pointer chain and does not yet have defensive bounds checking.
+
+You can check the active unwinder at runtime with:
+
+```rust
+println!("{:?}", pprof_alloc::capture_mode());
+```
+
+## Benchmarking Capture Overhead
+
+The repo includes a simple allocation benchmark for the frame-pointer unwinder:
+
+```bash
+RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --example capture_benchmark
+```
+
+The benchmark reports the active capture mode and a few allocation-heavy workloads.
 
 ## Reading the outputs
 
@@ -137,8 +160,7 @@ Those differences are where fragmentation, retention, cached pages, and allocato
 
 - Linux-first implementation.
 - `malloc_info` requires glibc and only reflects glibc allocator state.
-- The current profile export labels samples as `inuse_space`, but the implementation does not yet subtract frees.
-- Hash-based backtrace aggregation should be hardened before this is used for high-confidence attribution.
+- Stack capture assumes frame pointers are present and valid.
 - There is no sampling, rate limiting, or production-tuned overhead model yet.
 
 ## Repository layout

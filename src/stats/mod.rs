@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod cgroups;
@@ -6,7 +7,7 @@ mod malloc_info;
 mod procmaps;
 pub mod smaps;
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Allocations {
 	pub allocated: u64,
 	pub freed: u64,

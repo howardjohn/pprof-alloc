@@ -1,17 +1,23 @@
-#[cfg(not(feature = "frame-pointer"))]
-use backtrace::trace;
-#[cfg(feature = "frame-pointer")]
 use frame_pointer::trace;
 
 use itertools::Itertools;
+use serde::Serialize;
 use smallvec::SmallVec;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-mod backtrace;
 mod frame_pointer;
 
 const SOFT_MAX_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CaptureMode {
+	FramePointer,
+}
+
+pub const fn capture_mode() -> CaptureMode {
+	CaptureMode::FramePointer
+}
 
 #[derive(Clone)]
 struct UnresolvedFrames(SmallVec<[u64; SOFT_MAX_DEPTH]>);
