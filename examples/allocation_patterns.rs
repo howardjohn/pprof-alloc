@@ -3,7 +3,7 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[global_allocator]
-static GLOBAL: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new();
+static GLOBAL: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new().with_pprof().with_stats();
 
 fn main() {
 	let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -46,14 +46,11 @@ impl HashedBacktrace {
 	pub fn addrs(&self) -> Vec<u64> {
 		self.inner.0.iter().copied().collect_vec()
 	}
-	pub fn hash(&self) -> u64 {
-		self.hash
-	}
 }
 
 impl PartialEq for HashedBacktrace {
 	fn eq(&self, other: &Self) -> bool {
-		self.hash == other.hash
+		self.hash == other.hash && self.inner.0 == other.inner.0
 	}
 }
 
@@ -61,6 +58,6 @@ impl Eq for HashedBacktrace {}
 
 impl Hash for HashedBacktrace {
 	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.inner.0.iter().for_each(|x| state.write_u64((*x)));
+		self.inner.0.iter().for_each(|x| state.write_u64(*x));
 	}
 }

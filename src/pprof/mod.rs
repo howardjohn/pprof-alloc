@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use prost::Message;
+use smallvec::SmallVec;
 
 pub use cast::CastFrom;
 pub use cast::TryCastFrom;
@@ -56,7 +57,7 @@ impl StringTable {
 #[derive(Clone, Debug)]
 pub struct WeightedStack {
 	pub addrs: Vec<u64>,
-	pub weight: f64,
+	pub values: SmallVec<[i64; 4]>,
 }
 
 /// A mapping of a single shared object.
@@ -99,11 +100,11 @@ impl StackProfile {
 	/// (see `pprof/profile.proto`).
 	pub fn to_pprof(
 		&self,
-		sample_type: (&str, &str),
+		sample_types: &[(&str, &str)],
 		period_type: (&str, &str),
 		anno_key: Option<String>,
 	) -> Vec<u8> {
-		let profile = self.to_pprof_proto(sample_type, period_type, anno_key);
+		let profile = self.to_pprof_proto(sample_types, period_type, anno_key);
 		let encoded = profile.encode_to_vec();
 
 		let mut gz = GzEncoder::new(Vec::new(), Compression::default());
@@ -114,24 +115,33 @@ impl StackProfile {
 	/// Converts the profile into the pprof Protobuf format (see `pprof/profile.proto`).
 	fn to_pprof_proto(
 		&self,
-		sample_type: (&str, &str),
+		sample_types: &[(&str, &str)],
 		period_type: (&str, &str),
 		anno_key: Option<String>,
 	) -> proto::Profile {
+		assert!(
+			!sample_types.is_empty(),
+			"pprof needs at least one sample type"
+		);
+
 		let mut profile = proto::Profile::default();
 		profile.sample.reserve(self.stacks.len());
 		let mut strings = StringTable::new();
 
 		let anno_key = anno_key.unwrap_or_else(|| "annotation".into());
 
-		profile.sample_type = vec![proto::ValueType {
-			r#type: strings.insert(sample_type.0),
-			unit: strings.insert(sample_type.1),
-		}];
+		profile.sample_type = sample_types
+			.iter()
+			.map(|(sample_type, unit)| proto::ValueType {
+				r#type: strings.insert(sample_type),
+				unit: strings.insert(unit),
+			})
+			.collect();
 		profile.period_type = Some(proto::ValueType {
 			r#type: strings.insert(period_type.0),
 			unit: strings.insert(period_type.1),
 		});
+		profile.default_sample_type = strings.insert(sample_types.last().unwrap().0);
 
 		profile.time_nanos = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -164,10 +174,12 @@ impl StackProfile {
 		let mut function_ids = BTreeMap::new();
 		for (stack, anno) in self.iter() {
 			let mut sample = proto::Sample::default();
-
-			let value = stack.weight.trunc();
-			let value = i64::try_cast_from(value).expect("no exabyte heap sizes");
-			sample.value.push(value);
+			assert_eq!(
+				stack.values.len(),
+				sample_types.len(),
+				"each sample must provide one value per sample type"
+			);
+			sample.value.extend_from_slice(&stack.values);
 
 			for addr in stack.addrs.iter().rev() {
 				if *addr == 0 {
@@ -327,5 +339,44 @@ impl StackProfile {
 			inner: self,
 			idx: 0,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use flate2::read::GzDecoder;
+	use smallvec::smallvec;
+	use std::io::Read;
+
+	#[test]
+	fn profile_can_emit_alloc_and_inuse_sample_types() {
+		let mut profile = StackProfile::default();
+		profile.push_stack(
+			WeightedStack {
+				addrs: vec![0x1000],
+				values: smallvec![42, 7],
+			},
+			None,
+		);
+
+		let encoded = profile.to_pprof(
+			&[("alloc_space", "bytes"), ("inuse_space", "bytes")],
+			("space", "bytes"),
+			None,
+		);
+
+		let mut decoder = GzDecoder::new(encoded.as_slice());
+		let mut decoded_bytes = Vec::new();
+		decoder.read_to_end(&mut decoded_bytes).unwrap();
+
+		let decoded = proto::Profile::decode(decoded_bytes.as_slice()).unwrap();
+		assert_eq!(decoded.sample_type.len(), 2);
+		assert_eq!(decoded.sample.len(), 1);
+		assert_eq!(decoded.sample[0].value, vec![42, 7]);
+		assert_eq!(
+			decoded.string_table[decoded.default_sample_type as usize],
+			"inuse_space"
+		);
 	}
 }

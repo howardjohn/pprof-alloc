@@ -2,7 +2,6 @@
 
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::io::Read;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Permissions {

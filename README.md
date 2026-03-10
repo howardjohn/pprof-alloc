@@ -126,7 +126,7 @@ Current caveats:
 
 The crate is most useful when you compare the memory views instead of treating any single number as "truth".
 
-- `pprof`: stack-attributed allocation volume. Today this is closer to cumulative allocated bytes than live bytes.
+- `pprof`: stack-attributed bytes with both `alloc_space` and `inuse_space` sample types in one profile.
 - `stats::malloc`: allocator-managed memory according to glibc, including arena/system totals.
 - `stats::smaps`: what the kernel says is resident and anonymous for the process.
 - `stats::cgroups`: what the container cgroup is currently charged for, including working-set-style fields.

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod cgroups;
 pub mod malloc;
@@ -6,12 +6,22 @@ mod malloc_info;
 mod procmaps;
 pub mod smaps;
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Allocations {
 	pub allocated: u64,
 	pub freed: u64,
 	pub allocations: u64,
 	pub frees: u64,
+}
+
+impl Allocations {
+	pub fn in_use_bytes(&self) -> u64 {
+		self.allocated.saturating_sub(self.freed)
+	}
+
+	pub fn in_use_allocations(&self) -> u64 {
+		self.allocations.saturating_sub(self.frees)
+	}
 }
 
 #[derive(Default, Debug)]
@@ -31,15 +41,19 @@ impl AtomicAllocations {
 			frees: AtomicU64::new(0),
 		}
 	}
+
+	pub(crate) fn snapshot(&self) -> Allocations {
+		Allocations {
+			allocated: self.allocated.load(Ordering::Relaxed),
+			freed: self.freed.load(Ordering::Relaxed),
+			allocations: self.allocations.load(Ordering::Relaxed),
+			frees: self.frees.load(Ordering::Relaxed),
+		}
+	}
 }
 
 impl From<AtomicAllocations> for Allocations {
 	fn from(val: AtomicAllocations) -> Self {
-		Allocations {
-			allocated: val.allocated.load(std::sync::atomic::Ordering::Relaxed),
-			freed: val.freed.load(std::sync::atomic::Ordering::Relaxed),
-			allocations: val.allocations.load(std::sync::atomic::Ordering::Relaxed),
-			frees: val.frees.load(std::sync::atomic::Ordering::Relaxed),
-		}
+		val.snapshot()
 	}
 }
