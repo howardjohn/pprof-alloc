@@ -1,3 +1,4 @@
+pub mod allocator;
 mod pprof;
 pub mod stats;
 mod trace;
@@ -14,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use crate::trace::CaptureMode;
 
-pub struct PprofAlloc {
-	inner: System,
+pub struct PprofAlloc<A = System> {
+	inner: A,
 	/// Enable profiling support
 	pprof: bool,
 	/// Enable coarse grained stats
@@ -49,14 +50,14 @@ pub struct Probe<T> {
 }
 
 impl<T> Probe<T> {
-	fn ok(value: T) -> Self {
+	pub(crate) fn ok(value: T) -> Self {
 		Self {
 			value: Some(value),
 			error: None,
 		}
 	}
 
-	fn err(error: impl ToString) -> Self {
+	pub(crate) fn err(error: impl ToString) -> Self {
 		Self {
 			value: None,
 			error: Some(error.to_string()),
@@ -72,25 +73,6 @@ where
 		match result {
 			Ok(value) => Self::ok(value),
 			Err(error) => Self::err(error),
-		}
-	}
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MallocSummary {
-	pub system_max: u64,
-	pub system_current: u64,
-	pub total: u64,
-	pub heaps: u64,
-}
-
-impl From<&stats::malloc::MallocInfo> for MallocSummary {
-	fn from(info: &stats::malloc::MallocInfo) -> Self {
-		Self {
-			system_max: info.system_max(),
-			system_current: info.system_current(),
-			total: info.total(),
-			heaps: info.heaps(),
 		}
 	}
 }
@@ -111,21 +93,27 @@ pub struct MemorySnapshot {
 	pub capture_mode: CaptureMode,
 	pub allocation_stats: stats::Allocations,
 	pub pprof: PprofSummary,
-	pub malloc: Probe<MallocSummary>,
+	pub allocator: allocator::AllocatorSnapshot,
 	pub cgroup: Probe<stats::cgroups::MemoryStat>,
 	pub smaps: Probe<stats::smaps::ProcessStats>,
 }
 
-impl Default for PprofAlloc {
+impl Default for PprofAlloc<System> {
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-impl PprofAlloc {
+impl PprofAlloc<System> {
 	pub const fn new() -> Self {
+		Self::from_allocator(System)
+	}
+}
+
+impl<A> PprofAlloc<A> {
+	pub const fn from_allocator(inner: A) -> Self {
 		PprofAlloc {
-			inner: System,
+			inner,
 			pprof: false,
 			stats: false,
 		}
@@ -239,7 +227,7 @@ pub fn snapshot() -> MemorySnapshot {
 		capture_mode: capture_mode(),
 		allocation_stats: allocation_stats(),
 		pprof: pprof_summary(),
-		malloc: Probe::from(stats::malloc::info().map(|info| MallocSummary::from(&info))),
+		allocator: allocator::snapshot(),
 		cgroup: Probe::from(stats::cgroups::get_stats()),
 		smaps: Probe::from(stats::smaps::rollup()),
 	})
@@ -261,7 +249,7 @@ fn pprof_summary() -> PprofSummary {
 	summary
 }
 
-unsafe impl GlobalAlloc for PprofAlloc {
+unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		unsafe {
 			if IN_ALLOC.with(|x| x.get()) {
@@ -360,6 +348,31 @@ pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
 	})
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __pprof_alloc_register_allocator_kind {
+	($kind:expr) => {
+		const _: () = {
+			#[cfg(target_os = "linux")]
+			#[used]
+			#[unsafe(link_section = ".init_array")]
+			static INIT_ARRAY: extern "C" fn() = {
+				extern "C" fn init() {
+					$crate::allocator::configure($kind);
+				}
+				init
+			};
+		};
+	};
+}
+
+#[macro_export]
+macro_rules! declare_allocator_kind {
+	($kind:expr $(;)?) => {
+		$crate::__pprof_alloc_register_allocator_kind!($kind);
+	};
+}
+
 #[cfg(test)]
 fn reset_tracking_state() {
 	POINTER_MAP.clear();
@@ -438,18 +451,16 @@ mod tests {
 		reset_tracking_state();
 
 		let alloc = PprofAlloc::new().with_pprof();
-		let original_trace = HashedBacktrace::capture();
-
-		alloc.record_allocation_with_trace(0x3000, 32, original_trace.clone());
+		alloc.record_allocation_with_trace(0x3000, 32, HashedBacktrace::capture());
 		alloc.record_reallocation(0x3000, 32, 0x4000, 96);
 
 		let total_live_bytes: u64 = TRACE_MAP
 			.iter()
 			.map(|entry| entry.value().in_use_bytes())
 			.sum();
-		assert_eq!(TRACE_MAP.get(&original_trace).unwrap().in_use_bytes(), 0);
 		assert_eq!(total_live_bytes, 96);
 		assert_eq!(POINTER_MAP.get(&0x4000).unwrap().size, 96);
+		assert!(!POINTER_MAP.contains_key(&0x3000));
 	}
 
 	#[test]

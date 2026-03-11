@@ -76,6 +76,20 @@ Use the allocator wrapper as your global allocator:
 #[global_allocator]
 static GLOBAL: pprof_alloc::PprofAlloc =
     pprof_alloc::PprofAlloc::new().with_pprof().with_stats();
+
+pprof_alloc::declare_allocator_kind!(pprof_alloc::allocator::AllocatorKind::Glibc);
+```
+
+Or wrap a different allocator directly:
+
+```rust
+#[global_allocator]
+static GLOBAL: pprof_alloc::PprofAlloc<mimalloc::MiMalloc> =
+    pprof_alloc::PprofAlloc::from_allocator(mimalloc::MiMalloc)
+        .with_pprof()
+        .with_stats();
+
+pprof_alloc::declare_allocator_kind!(pprof_alloc::allocator::AllocatorKind::Mimalloc);
 ```
 
 Generate a profile:
@@ -100,14 +114,23 @@ let snapshot = pprof_alloc::snapshot();
 let json = serde_json::to_string_pretty(&snapshot)?;
 ```
 
+The allocator section of the snapshot is split into:
+
+- `comparable`: normalized cross-allocator fields for head-to-head comparison
+- `specific`: allocator-specific detail for deeper debugging
+
+`declare_allocator_kind!(...)` registers the allocator kind once at process startup, so you declare the global allocator and its kind side by side without doing any setup in `main()` and without touching allocator metadata in the hot path.
+
 Register Prometheus collectors:
 
 ```rust
 let mut registry = prometheus_client::registry::Registry::default();
-pprof_alloc::stats::malloc::PrometheusCollector::register(&mut registry);
+pprof_alloc::allocator::PrometheusCollector::register(&mut registry);
 pprof_alloc::stats::cgroups::PrometheusCollector::register(&mut registry);
 pprof_alloc::stats::smaps::PrometheusCollector::register(&mut registry);
 ```
+
+`stats::malloc::PrometheusCollector` is still available, but it is glibc-specific and not the right surface for cross-allocator comparison.
 
 Run the example:
 
@@ -120,7 +143,7 @@ cargo run --example allocation_patterns
 Frame-pointer unwinding requires frame pointers to be preserved:
 
 ```bash
-RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --example allocation_patterns
+cargo run --example allocation_patterns
 ```
 
 Current caveats:
@@ -140,7 +163,7 @@ println!("{:?}", pprof_alloc::capture_mode());
 The repo includes a simple allocation benchmark for the frame-pointer unwinder:
 
 ```bash
-RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --example capture_benchmark
+cargo run --example capture_benchmark
 ```
 
 The benchmark reports the active capture mode and a few allocation-heavy workloads.
