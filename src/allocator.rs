@@ -3,13 +3,16 @@ use crate::stats;
 use anyhow::Result;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
+use prometheus_client::encoding::EncodeMetric;
 use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::metrics::info::Info;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorKind {
+	Undeclared,
 	Glibc,
 	Jemalloc,
 	Mimalloc,
@@ -33,12 +36,23 @@ impl PrometheusCollector {
 
 impl Collector for PrometheusCollector {
 	fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
-		use prometheus_client::encoding::EncodeMetric;
-
 		let snapshot = snapshot();
-		let Some(comparable) = snapshot.comparable.value.as_ref() else {
-			return Ok(());
-		};
+		let info_metric = Info::new(vec![("allocator", snapshot.kind.as_str())]);
+		let info_encoder = encoder.encode_descriptor(
+			"allocator_info",
+			"allocator identity for this process",
+			None,
+			info_metric.metric_type(),
+		)?;
+		info_metric.encode(info_encoder)?;
+		let configured_metric = ConstGauge::new(u64::from(snapshot.kind != AllocatorKind::Undeclared));
+		let configured_encoder = encoder.encode_descriptor(
+			"allocator_configured",
+			"whether allocator kind was explicitly declared for this process",
+			None,
+			configured_metric.metric_type(),
+		)?;
+		configured_metric.encode(configured_encoder)?;
 
 		let mut encode = |value: Option<u64>, name: &'static str, help: &str| {
 			let Some(value) = value else {
@@ -48,6 +62,10 @@ impl Collector for PrometheusCollector {
 			let metric_encoder = encoder.encode_descriptor(name, help, None, metric.metric_type())?;
 			metric.encode(metric_encoder)?;
 			Ok(())
+		};
+
+		let Some(comparable) = snapshot.comparable.value.as_ref() else {
+			return Ok(());
 		};
 
 		encode(
@@ -276,22 +294,33 @@ struct MiStats {
 	page_bins: [MiStatCount; 74],
 }
 
-static CONFIGURED_ALLOCATOR: AtomicU8 = AtomicU8::new(AllocatorKind::Glibc.as_u8());
+static CONFIGURED_ALLOCATOR: AtomicU8 = AtomicU8::new(AllocatorKind::Undeclared.as_u8());
 
 impl AllocatorKind {
 	const fn as_u8(self) -> u8 {
 		match self {
-			Self::Glibc => 0,
-			Self::Jemalloc => 1,
-			Self::Mimalloc => 2,
+			Self::Undeclared => 0,
+			Self::Glibc => 1,
+			Self::Jemalloc => 2,
+			Self::Mimalloc => 3,
 		}
 	}
 
 	const fn from_u8(value: u8) -> Self {
 		match value {
-			1 => Self::Jemalloc,
-			2 => Self::Mimalloc,
-			_ => Self::Glibc,
+			1 => Self::Glibc,
+			2 => Self::Jemalloc,
+			3 => Self::Mimalloc,
+			_ => Self::Undeclared,
+		}
+	}
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Undeclared => "undeclared",
+			Self::Glibc => "glibc",
+			Self::Jemalloc => "jemalloc",
+			Self::Mimalloc => "mimalloc",
 		}
 	}
 }
@@ -310,6 +339,12 @@ pub fn snapshot() -> AllocatorSnapshot {
 
 pub fn snapshot_for(kind: AllocatorKind) -> AllocatorSnapshot {
 	match kind {
+		AllocatorKind::Undeclared => backend_snapshot(
+			kind,
+			Err(anyhow::anyhow!(
+				"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
+			)),
+		),
 		AllocatorKind::Glibc => {
 			let result = glibc_snapshot().map(|stats| {
 				(
@@ -515,4 +550,62 @@ const fn zero_count() -> MiStatCount {
 #[cfg(feature = "allocator-mimalloc")]
 const fn zero_counter() -> MiStatCounter {
 	MiStatCounter { total: 0 }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use parking_lot::Mutex;
+	use prometheus_client::encoding::text::encode;
+	use prometheus_client::registry::Registry;
+
+	static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+	#[test]
+	fn snapshot_reports_undeclared_allocator_as_error() {
+		let _guard = TEST_GUARD.lock();
+		configure(AllocatorKind::Undeclared);
+
+		let snapshot = snapshot();
+		assert_eq!(snapshot.kind, AllocatorKind::Undeclared);
+		assert!(snapshot.comparable.value.is_none());
+		assert!(snapshot.specific.value.is_none());
+		assert_eq!(
+			snapshot.comparable.error.as_deref(),
+			Some(
+				"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
+			)
+		);
+	}
+
+	#[test]
+	fn prometheus_collector_emits_allocator_info_metric() {
+		let _guard = TEST_GUARD.lock();
+		configure(AllocatorKind::Glibc);
+
+		let mut registry = Registry::default();
+		PrometheusCollector::register(&mut registry);
+
+		let mut output = String::new();
+		encode(&mut output, &registry).expect("allocator metrics should encode");
+
+		assert!(output.contains("# TYPE allocator_info info"));
+		assert!(output.contains("allocator_info_info{allocator=\"glibc\"} 1"));
+		assert!(output.contains("allocator_configured 1"));
+	}
+
+	#[test]
+	fn prometheus_collector_emits_undeclared_allocator_signal() {
+		let _guard = TEST_GUARD.lock();
+		configure(AllocatorKind::Undeclared);
+
+		let mut registry = Registry::default();
+		PrometheusCollector::register(&mut registry);
+
+		let mut output = String::new();
+		encode(&mut output, &registry).expect("allocator metrics should encode");
+
+		assert!(output.contains("allocator_info_info{allocator=\"undeclared\"} 1"));
+		assert!(output.contains("allocator_configured 0"));
+	}
 }

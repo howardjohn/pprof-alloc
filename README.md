@@ -18,8 +18,8 @@ What exists today:
 - `pprof` export for captured stacks, including Linux shared-object mappings and build IDs for offline symbolization.
 - Linux memory collectors for:
   - glibc `malloc_info`
-  - cgroup v2 `memory.current` and `memory.stat`
-  - `/proc/self/smaps_rollup`
+  - cgroup v2 `memory.current` and `memory.stat`, including slab, shmem, and workingset/page-fault signals
+  - `/proc/self/smaps_rollup`, including dirty, hugepage, and swap-related process rollups
 - Prometheus collectors for the Linux memory views above.
 - An `allocation_patterns` example that exercises a range of allocation behaviors.
 
@@ -65,8 +65,8 @@ The current crate has three main pieces:
 3. Linux memory stats
 
 - `stats::malloc` exposes parsed `malloc_info` output from glibc.
-- `stats::cgroups` exposes cgroup v2 memory usage and working-set-style fields.
-- `stats::smaps` exposes rollup data from `/proc/self/smaps_rollup`.
+- `stats::cgroups` exposes cgroup v2 memory usage, reclaimable vs unreclaimable kernel memory, and page-fault/workingset counters.
+- `stats::smaps` exposes rollup data from `/proc/self/smaps_rollup`, including dirty, swap, and hugepage signals.
 
 ## Quick start
 
@@ -121,6 +121,8 @@ The allocator section of the snapshot is split into:
 
 `declare_allocator_kind!(...)` registers the allocator kind once at process startup, so you declare the global allocator and its kind side by side without doing any setup in `main()` and without touching allocator metadata in the hot path.
 
+If you omit `declare_allocator_kind!(...)`, the crate now reports the allocator as `undeclared` instead of silently defaulting to glibc. In that state, allocator comparison metrics are withheld and the snapshot surface reports an explicit configuration error.
+
 Register Prometheus collectors:
 
 ```rust
@@ -131,6 +133,8 @@ pprof_alloc::stats::smaps::PrometheusCollector::register(&mut registry);
 ```
 
 `stats::malloc::PrometheusCollector` is still available, but it is glibc-specific and not the right surface for cross-allocator comparison.
+
+`allocator::PrometheusCollector` always exports `allocator_info{allocator="..."}` and `allocator_configured`, and only exports normalized allocator byte metrics when that backend can provide the corresponding field without inventing a fake zero.
 
 Run the example:
 
@@ -174,8 +178,8 @@ The crate is most useful when you compare the memory views instead of treating a
 
 - `pprof`: stack-attributed bytes with both `alloc_space` and `inuse_space` sample types in one profile.
 - `stats::malloc`: allocator-managed memory according to glibc, including arena/system totals.
-- `stats::smaps`: what the kernel says is resident and anonymous for the process.
-- `stats::cgroups`: what the container cgroup is currently charged for, including working-set-style fields.
+- `stats::smaps`: what the kernel says is resident, anonymous, dirty, swapped, or backed by huge pages for the process.
+- `stats::cgroups`: what the container cgroup is currently charged for, including anon/file/kernel splits and reclaim/refault pressure signals.
 
 Those differences are where fragmentation, retention, cached pages, and allocator policy start to show up.
 
