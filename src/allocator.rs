@@ -443,6 +443,7 @@ fn mimalloc_snapshot() -> Result<MimallocStats> {
 
 	unsafe extern "C" {
 		fn mi_stats_get(stats_size: usize, stats: *mut MiStats);
+		fn mi_stats_merge();
 	}
 
 	let mut stats = MiStats {
@@ -500,6 +501,9 @@ fn mimalloc_snapshot() -> Result<MimallocStats> {
 	let mut page_faults = 0usize;
 
 	unsafe {
+		// `mi_stats_get` copies the subprocess aggregate only; merge current
+		// thread-local stats first so live allocation counters are up to date.
+		mi_stats_merge();
 		mi_stats_get(std::mem::size_of::<MiStats>(), &mut stats);
 		mi_process_info(
 			&mut elapsed_msecs,
