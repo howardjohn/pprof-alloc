@@ -138,7 +138,9 @@ pub enum AllocatorSpecificDetails {
 pub struct GlibcStats {
 	pub system_max: u64,
 	pub system_current: u64,
-	pub total: u64,
+	pub free_bytes: u64,
+	pub mmap_current: u64,
+	pub in_use_bytes: u64,
 	pub heaps: u64,
 }
 
@@ -147,7 +149,9 @@ impl From<&stats::malloc::MallocInfo> for GlibcStats {
 		Self {
 			system_max: info.system_max(),
 			system_current: info.system_current(),
-			total: info.total(),
+			free_bytes: info.free_bytes(),
+			mmap_current: info.mmap_bytes(),
+			in_use_bytes: info.in_use_bytes(),
 			heaps: info.heaps(),
 		}
 	}
@@ -156,11 +160,11 @@ impl From<&stats::malloc::MallocInfo> for GlibcStats {
 impl From<&GlibcStats> for AllocatorComparisonStats {
 	fn from(stats: &GlibcStats) -> Self {
 		Self {
-			allocated_bytes: Some(stats.total),
+			allocated_bytes: Some(stats.in_use_bytes),
 			active_bytes: None,
 			resident_bytes: None,
-			mapped_bytes: Some(stats.system_current),
-			retained_bytes: None,
+			mapped_bytes: Some(stats.system_current.saturating_add(stats.mmap_current)),
+			retained_bytes: Some(stats.free_bytes),
 			metadata_bytes: None,
 			committed_bytes: None,
 			allocator_structures: Some(stats.heaps),
@@ -200,6 +204,8 @@ impl From<&JemallocStats> for AllocatorComparisonStats {
 #[derive(Clone, Debug, Serialize)]
 pub struct MimallocStats {
 	pub version: u32,
+	pub allocated_current: u64,
+	pub allocated_peak: u64,
 	pub reserved_current: u64,
 	pub reserved_peak: u64,
 	pub committed_current: u64,
@@ -226,7 +232,7 @@ pub struct MimallocStats {
 impl From<&MimallocStats> for AllocatorComparisonStats {
 	fn from(stats: &MimallocStats) -> Self {
 		Self {
-			allocated_bytes: Some(stats.requested_current),
+			allocated_bytes: Some(stats.allocated_current),
 			active_bytes: None,
 			resident_bytes: Some(stats.process_rss_current),
 			mapped_bytes: Some(stats.reserved_current),
@@ -515,6 +521,16 @@ fn mimalloc_snapshot() -> Result<MimallocStats> {
 
 	Ok(MimallocStats {
 		version: stats.version as u32,
+		allocated_current: stats
+			.malloc_normal
+			.current
+			.max(0)
+			.saturating_add(stats.malloc_huge.current.max(0)) as u64,
+		allocated_peak: stats
+			.malloc_normal
+			.peak
+			.max(0)
+			.saturating_add(stats.malloc_huge.peak.max(0)) as u64,
 		reserved_current: stats.reserved.current.max(0) as u64,
 		reserved_peak: stats.reserved.peak.max(0) as u64,
 		committed_current: stats.committed.current.max(0) as u64,
@@ -607,5 +623,56 @@ mod tests {
 
 		assert!(output.contains("allocator_info_info{allocator=\"undeclared\"} 1"));
 		assert!(output.contains("allocator_configured 0"));
+	}
+
+	#[test]
+	fn glibc_comparison_stats_use_in_use_and_free_bytes() {
+		let comparable = AllocatorComparisonStats::from(&GlibcStats {
+			system_max: 8192,
+			system_current: 4096,
+			free_bytes: 1024,
+			mmap_current: 512,
+			in_use_bytes: 3584,
+			heaps: 3,
+		});
+
+		assert_eq!(comparable.allocated_bytes, Some(3584));
+		assert_eq!(comparable.mapped_bytes, Some(4608));
+		assert_eq!(comparable.retained_bytes, Some(1024));
+		assert_eq!(comparable.allocator_structures, Some(3));
+	}
+
+	#[cfg(feature = "allocator-mimalloc")]
+	#[test]
+	fn mimalloc_comparison_stats_use_allocator_allocated_bytes() {
+		let comparable = AllocatorComparisonStats::from(&MimallocStats {
+			version: 1,
+			allocated_current: 2048,
+			allocated_peak: 4096,
+			reserved_current: 8192,
+			reserved_peak: 12288,
+			committed_current: 4096,
+			committed_peak: 6144,
+			reset_current: 0,
+			purged_current: 0,
+			page_committed_current: 0,
+			pages_current: 0,
+			pages_abandoned_current: 0,
+			segments_current: 0,
+			segments_abandoned_current: 0,
+			threads_current: 0,
+			requested_current: 0,
+			requested_peak: 0,
+			process_rss_current: 3072,
+			process_rss_peak: 6144,
+			process_commit_current: 4096,
+			process_commit_peak: 8192,
+			page_faults: 0,
+			arenas: 2,
+		});
+
+		assert_eq!(comparable.allocated_bytes, Some(2048));
+		assert_eq!(comparable.committed_bytes, Some(4096));
+		assert_eq!(comparable.allocator_structures, Some(2));
 	}
 }

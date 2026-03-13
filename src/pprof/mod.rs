@@ -181,22 +181,14 @@ impl StackProfile {
 			);
 			sample.value.extend_from_slice(&stack.values);
 
-			for addr in stack.addrs.iter().rev() {
+			for addr in &stack.addrs {
 				if *addr == 0 {
 					continue;
 				}
-				// See the comment
-				// [here](https://github.com/rust-lang/backtrace-rs/blob/036d4909e1fb9c08c2bb0f59ac81994e39489b2f/src/symbolize/mod.rs#L123-L147)
-				// for why we need to subtract one. tl;dr addresses
-				// in stack traces are actually the return address of
-				// the called function, which is one past the call
-				// itself.
-				//
-				// Of course, the `call` instruction can be more than one byte, so after subtracting
-				// one, we might point somewhere in the middle of it, rather
-				// than to the beginning of the instruction. That's fine; symbolization
-				// tools don't seem to get confused by this.
-				let addr = u64::cast_from(*addr) - 1;
+				// Stack capture already records addresses in leaf-to-root order and normalizes
+				// caller return PCs into an instruction address. Preserve that order here because
+				// profile.proto expects location_id[0] to be the leaf frame.
+				let addr = u64::cast_from(*addr);
 
 				// Find the mapping for this address (search once)
 				let mapping_info = self.mappings.iter().enumerate().find(|(_, mapping)| {
@@ -378,5 +370,38 @@ mod tests {
 			decoded.string_table[decoded.default_sample_type as usize],
 			"inuse_space"
 		);
+	}
+
+	#[test]
+	fn profile_preserves_leaf_to_root_stack_order() {
+		let mut profile = StackProfile::default();
+		profile.push_stack(
+			WeightedStack {
+				addrs: vec![0x1000, 0x2000, 0x3000],
+				values: smallvec![1],
+			},
+			None,
+		);
+
+		let encoded = profile.to_pprof(&[("inuse_space", "bytes")], ("space", "bytes"), None);
+
+		let mut decoder = GzDecoder::new(encoded.as_slice());
+		let mut decoded_bytes = Vec::new();
+		decoder.read_to_end(&mut decoded_bytes).unwrap();
+
+		let decoded = proto::Profile::decode(decoded_bytes.as_slice()).unwrap();
+		let sample = &decoded.sample[0];
+		let by_id = decoded
+			.location
+			.iter()
+			.map(|location| (location.id, location.address))
+			.collect::<BTreeMap<_, _>>();
+		let sample_addrs = sample
+			.location_id
+			.iter()
+			.map(|id| *by_id.get(id).unwrap())
+			.collect::<Vec<_>>();
+
+		assert_eq!(sample_addrs, vec![0x1000, 0x2000, 0x3000]);
 	}
 }

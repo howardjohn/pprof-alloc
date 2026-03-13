@@ -1,6 +1,6 @@
 use crate::stats::malloc_info;
 use crate::stats::malloc_info::Error;
-use crate::stats::malloc_info::info::{Malloc, SystemType};
+use crate::stats::malloc_info::info::{Malloc, SystemType, TotalType};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
 use prometheus_client::metrics::gauge::ConstGauge;
@@ -21,6 +21,16 @@ pub fn malloc_trim() {
 pub struct MallocInfo(pub Malloc);
 
 impl MallocInfo {
+	fn total_by_type(&self, r#type: TotalType) -> u64 {
+		self
+			.0
+			.total
+			.iter()
+			.filter(|t| t.r#type == r#type)
+			.map(|t| t.size as u64)
+			.sum()
+	}
+
 	pub fn system_max(&self) -> u64 {
 		self
 			.0
@@ -40,8 +50,24 @@ impl MallocInfo {
 			.unwrap_or_default()
 	}
 	pub fn total(&self) -> u64 {
-		self.0.total.iter().map(|t| (t.size * t.count) as u64).sum()
+		self.0.total.iter().map(|t| t.size as u64).sum()
 	}
+
+	pub fn free_bytes(&self) -> u64 {
+		self.total_by_type(TotalType::Fast) + self.total_by_type(TotalType::Rest)
+	}
+
+	pub fn mmap_bytes(&self) -> u64 {
+		self.total_by_type(TotalType::Mmap)
+	}
+
+	pub fn in_use_bytes(&self) -> u64 {
+		self
+			.system_current()
+			.saturating_sub(self.free_bytes())
+			.saturating_add(self.mmap_bytes())
+	}
+
 	pub fn heaps(&self) -> u64 {
 		self.0.heaps.len() as u64
 	}
@@ -72,5 +98,44 @@ impl Collector for PrometheusCollector {
 		encode(s.system_current(), "malloc_current", "total current memory")?;
 		encode(s.heaps(), "malloc_heaps", "current heaps used")?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn totals_treat_total_size_as_bytes_not_size_times_count() {
+		let parsed: Malloc = quick_xml::de::from_str(
+			r#"
+<malloc version="1">
+<heap nr="0">
+<sizes>
+</sizes>
+<total type="fast" count="2" size="256"/>
+<total type="rest" count="3" size="1024"/>
+<system type="current" size="4096"/>
+<system type="max" size="4096"/>
+<aspace type="total" size="4096"/>
+<aspace type="mprotect" size="4096"/>
+</heap>
+<total type="fast" count="2" size="256"/>
+<total type="rest" count="3" size="1024"/>
+<total type="mmap" count="1" size="512"/>
+<system type="current" size="4096"/>
+<system type="max" size="4096"/>
+<aspace type="total" size="4096"/>
+<aspace type="mprotect" size="4096"/>
+</malloc>
+"#,
+		)
+		.expect("parse XML");
+		let info = MallocInfo(parsed);
+
+		assert_eq!(info.total(), 1792);
+		assert_eq!(info.free_bytes(), 1280);
+		assert_eq!(info.mmap_bytes(), 512);
+		assert_eq!(info.in_use_bytes(), 3328);
 	}
 }
