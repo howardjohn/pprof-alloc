@@ -54,7 +54,7 @@ impl Collector for PrometheusCollector {
 		configured_metric.encode(configured_encoder)?;
 
 		let mut encode = |value: Option<u64>, name: &'static str, help: &str| {
-			let Some(value) = value else {
+			let Some(value) = prometheus_gauge_value(value) else {
 				return Ok(());
 			};
 			let metric = ConstGauge::new(value);
@@ -109,6 +109,10 @@ impl Collector for PrometheusCollector {
 		)?;
 		Ok(())
 	}
+}
+
+fn prometheus_gauge_value(value: Option<u64>) -> Option<u64> {
+	value.filter(|value| *value != u64::MAX)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -203,22 +207,12 @@ impl From<&JemallocStats> for AllocatorComparisonStats {
 #[derive(Clone, Debug, Serialize)]
 pub struct MimallocStats {
 	pub version: u32,
-	pub allocated_current: u64,
-	pub allocated_peak: u64,
 	pub reserved_current: u64,
 	pub reserved_peak: u64,
 	pub committed_current: u64,
 	pub committed_peak: u64,
 	pub reset_current: u64,
 	pub purged_current: u64,
-	pub page_committed_current: u64,
-	pub pages_current: u64,
-	pub pages_abandoned_current: u64,
-	pub segments_current: u64,
-	pub segments_abandoned_current: u64,
-	pub threads_current: u64,
-	pub requested_current: u64,
-	pub requested_peak: u64,
 	pub process_rss_current: u64,
 	pub process_rss_peak: u64,
 	pub process_commit_current: u64,
@@ -231,7 +225,7 @@ pub struct MimallocStats {
 impl From<&MimallocStats> for AllocatorComparisonStats {
 	fn from(stats: &MimallocStats) -> Self {
 		Self {
-			allocated_bytes: Some(stats.allocated_current),
+			allocated_bytes: None,
 			active_bytes: None,
 			resident_bytes: Some(stats.process_rss_current),
 			mapped_bytes: Some(stats.reserved_current),
@@ -435,7 +429,7 @@ fn mimalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecif
 
 #[cfg(feature = "allocator-mimalloc")]
 fn mimalloc_snapshot() -> Result<MimallocStats> {
-	use libmimalloc_sys::{mi_process_info, mi_stats_merge};
+	use libmimalloc_sys::mi_process_info;
 
 	unsafe extern "C" {
 		// `libmimalloc-sys` exposes most of the extended API we use, but it does
@@ -498,9 +492,6 @@ fn mimalloc_snapshot() -> Result<MimallocStats> {
 	let mut page_faults = 0usize;
 
 	unsafe {
-		// `mi_stats_get` copies the subprocess aggregate only; merge current
-		// thread-local stats first so live allocation counters are up to date.
-		mi_stats_merge();
 		mi_stats_get(std::mem::size_of::<MiStats>(), &mut stats);
 		mi_process_info(
 			&mut elapsed_msecs,
@@ -522,37 +513,24 @@ fn mimalloc_snapshot() -> Result<MimallocStats> {
 
 	Ok(MimallocStats {
 		version: stats.version as u32,
-		allocated_current: stats
-			.malloc_normal
-			.current
-			.max(0)
-			.saturating_add(stats.malloc_huge.current.max(0)) as u64,
-		allocated_peak: stats
-			.malloc_normal
-			.peak
-			.max(0)
-			.saturating_add(stats.malloc_huge.peak.max(0)) as u64,
 		reserved_current: stats.reserved.current.max(0) as u64,
 		reserved_peak: stats.reserved.peak.max(0) as u64,
 		committed_current: stats.committed.current.max(0) as u64,
 		committed_peak: stats.committed.peak.max(0) as u64,
 		reset_current: stats.reset.current.max(0) as u64,
 		purged_current: stats.purged.current.max(0) as u64,
-		page_committed_current: stats.page_committed.current.max(0) as u64,
-		pages_current: stats.pages.current.max(0) as u64,
-		pages_abandoned_current: stats.pages_abandoned.current.max(0) as u64,
-		segments_current: stats.segments.current.max(0) as u64,
-		segments_abandoned_current: stats.segments_abandoned.current.max(0) as u64,
-		threads_current: stats.threads.current.max(0) as u64,
-		requested_current: stats.malloc_requested.current.max(0) as u64,
-		requested_peak: stats.malloc_requested.peak.max(0) as u64,
-		process_rss_current: current_rss as u64,
-		process_rss_peak: peak_rss as u64,
-		process_commit_current: current_commit as u64,
-		process_commit_peak: peak_commit as u64,
+		process_rss_current: sanitize_mimalloc_process_value(current_rss),
+		process_rss_peak: sanitize_mimalloc_process_value(peak_rss),
+		process_commit_current: sanitize_mimalloc_process_value(current_commit),
+		process_commit_peak: sanitize_mimalloc_process_value(peak_commit),
 		page_faults: page_faults as u64,
 		arenas: stats.arena_count.total.max(0) as u64,
 	})
+}
+
+#[cfg(feature = "allocator-mimalloc")]
+fn sanitize_mimalloc_process_value(value: usize) -> u64 {
+	if value == usize::MAX { 0 } else { value as u64 }
 }
 
 #[cfg(feature = "allocator-mimalloc")]
@@ -637,27 +615,27 @@ mod tests {
 		assert_eq!(comparable.allocator_structures, Some(3));
 	}
 
+	#[test]
+	fn prometheus_gauge_value_rejects_u64_max() {
+		assert_eq!(prometheus_gauge_value(Some(u64::MAX)), None);
+		assert_eq!(
+			prometheus_gauge_value(Some(u64::MAX - 1)),
+			Some(u64::MAX - 1)
+		);
+		assert_eq!(prometheus_gauge_value(None), None);
+	}
+
 	#[cfg(feature = "allocator-mimalloc")]
 	#[test]
-	fn mimalloc_comparison_stats_use_allocator_allocated_bytes() {
+	fn mimalloc_comparison_stats_keep_process_level_fields() {
 		let comparable = AllocatorComparisonStats::from(&MimallocStats {
 			version: 1,
-			allocated_current: 2048,
-			allocated_peak: 4096,
 			reserved_current: 8192,
 			reserved_peak: 12288,
 			committed_current: 4096,
 			committed_peak: 6144,
 			reset_current: 0,
 			purged_current: 0,
-			page_committed_current: 0,
-			pages_current: 0,
-			pages_abandoned_current: 0,
-			segments_current: 0,
-			segments_abandoned_current: 0,
-			threads_current: 0,
-			requested_current: 0,
-			requested_peak: 0,
 			process_rss_current: 3072,
 			process_rss_peak: 6144,
 			process_commit_current: 4096,
@@ -666,8 +644,41 @@ mod tests {
 			arenas: 2,
 		});
 
-		assert_eq!(comparable.allocated_bytes, Some(2048));
+		assert_eq!(comparable.allocated_bytes, None);
+		assert_eq!(comparable.resident_bytes, Some(3072));
+		assert_eq!(comparable.mapped_bytes, Some(8192));
 		assert_eq!(comparable.committed_bytes, Some(4096));
 		assert_eq!(comparable.allocator_structures, Some(2));
+	}
+
+	#[cfg(feature = "allocator-mimalloc")]
+	#[test]
+	fn mimalloc_process_values_do_not_preserve_wrapped_max() {
+		assert_eq!(sanitize_mimalloc_process_value(usize::MAX), 0);
+		assert_eq!(sanitize_mimalloc_process_value(4096), 4096);
+	}
+
+	#[cfg(feature = "allocator-mimalloc")]
+	#[test]
+	fn mimalloc_comparison_stats_use_sanitized_process_rss() {
+		let comparable = AllocatorComparisonStats::from(&MimallocStats {
+			version: 1,
+			reserved_current: 8192,
+			reserved_peak: 12288,
+			committed_current: 4096,
+			committed_peak: 6144,
+			reset_current: 0,
+			purged_current: 0,
+			process_rss_current: 0,
+			process_rss_peak: 6144,
+			process_commit_current: 4096,
+			process_commit_peak: 8192,
+			page_faults: 0,
+			arenas: 2,
+		});
+
+		assert_eq!(comparable.resident_bytes, Some(0));
+		assert_eq!(comparable.allocated_bytes, None);
+		assert_eq!(comparable.committed_bytes, Some(4096));
 	}
 }

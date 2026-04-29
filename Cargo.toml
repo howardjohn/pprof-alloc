@@ -2,7 +2,7 @@
 name = "pprof-alloc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description = "Allocation profiling and Linux memory telemetry for Rust services."
 license = "Apache-2.0"
 repository = "https://github.com/howardjohn/pprof-alloc"
@@ -12,6 +12,7 @@ keywords = ["pprof", "allocator", "profiling", "memory", "heap"]
 categories = ["development-tools::profiling", "memory-management", "os::linux-apis"]
 include = [
 	"Cargo.toml",
+	"LICENSE",
 	"README.md",
 	"examples/**",
 	"src/**",
