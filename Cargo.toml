@@ -41,7 +41,7 @@ thiserror = "1.0.69"
 quick-xml = { version = "0.38.3", features = ["serialize"] }
 prometheus-client = "0.24.0"
 tikv-jemalloc-ctl = { version = "0.6.1", optional = true, features = ["stats", "use_std"] }
-libmimalloc-sys = { version = "0.1.44", optional = true, features = ["extended"] }
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 [[example]]
 name = "allocation_patterns"

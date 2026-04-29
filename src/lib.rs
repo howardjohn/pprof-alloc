@@ -233,6 +233,10 @@ pub fn snapshot() -> MemorySnapshot {
 	})
 }
 
+pub fn collect() -> anyhow::Result<()> {
+	enter_alloc(allocator::collect)
+}
+
 fn pprof_summary() -> PprofSummary {
 	let mut summary = PprofSummary::default();
 	for entry in TRACE_MAP.iter() {

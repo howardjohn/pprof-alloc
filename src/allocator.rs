@@ -339,6 +339,21 @@ pub fn configured() -> AllocatorKind {
 	AllocatorKind::from_u8(CONFIGURED_ALLOCATOR.load(Ordering::Acquire))
 }
 
+pub fn collect() -> Result<()> {
+	collect_for(configured())
+}
+
+pub fn collect_for(kind: AllocatorKind) -> Result<()> {
+	match kind {
+		AllocatorKind::Undeclared => anyhow::bail!(
+			"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
+		),
+		AllocatorKind::Glibc => glibc_collect(),
+		AllocatorKind::Jemalloc => jemalloc_collect(),
+		AllocatorKind::Mimalloc => mimalloc_collect(true),
+	}
+}
+
 pub fn snapshot() -> AllocatorSnapshot {
 	snapshot_for(configured())
 }
@@ -392,6 +407,19 @@ fn glibc_snapshot() -> Result<GlibcStats> {
 		.map_err(anyhow::Error::from)
 }
 
+fn glibc_collect() -> Result<()> {
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	{
+		stats::malloc::malloc_trim();
+		Ok(())
+	}
+
+	#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+	{
+		anyhow::bail!("glibc collection is only supported on linux-gnu targets")
+	}
+}
+
 #[cfg(feature = "allocator-jemalloc")]
 fn jemalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecificDetails)> {
 	let stats = jemalloc_snapshot()?;
@@ -403,6 +431,33 @@ fn jemalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecif
 
 #[cfg(not(feature = "allocator-jemalloc"))]
 fn jemalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecificDetails)> {
+	anyhow::bail!("jemalloc support is not compiled in; enable the `allocator-jemalloc` feature")
+}
+
+#[cfg(feature = "allocator-jemalloc")]
+fn jemalloc_collect() -> Result<()> {
+	use tikv_jemalloc_ctl::{arenas, raw};
+
+	unsafe {
+		// Cached thread-local objects need to be released before arena purge has
+		// a chance to return pages to the OS.
+		let _ = raw::write::<()>(b"thread.tcache.flush\0", ());
+	}
+
+	let narenas = arenas::narenas::read().map_err(anyhow::Error::from)?;
+	let mut purge_mib = [0; 3];
+	raw::name_to_mib(b"arena.0.purge\0", &mut purge_mib).map_err(anyhow::Error::from)?;
+	for arena in 0..narenas {
+		purge_mib[1] = arena as usize;
+		unsafe {
+			raw::write_mib::<()>(&purge_mib, ()).map_err(anyhow::Error::from)?;
+		}
+	}
+	Ok(())
+}
+
+#[cfg(not(feature = "allocator-jemalloc"))]
+fn jemalloc_collect() -> Result<()> {
 	anyhow::bail!("jemalloc support is not compiled in; enable the `allocator-jemalloc` feature")
 }
 
@@ -438,12 +493,26 @@ fn mimalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecif
 }
 
 #[cfg(feature = "allocator-mimalloc")]
+pub fn mimalloc_collect(force: bool) -> Result<()> {
+	unsafe {
+		libmimalloc_sys::mi_collect(force);
+	}
+	Ok(())
+}
+
+#[cfg(not(feature = "allocator-mimalloc"))]
+pub fn mimalloc_collect(_force: bool) -> Result<()> {
+	anyhow::bail!("mimalloc support is not compiled in; enable the `allocator-mimalloc` feature")
+}
+
+#[cfg(feature = "allocator-mimalloc")]
 fn mimalloc_snapshot() -> Result<MimallocStats> {
-	use libmimalloc_sys::mi_process_info;
+	use libmimalloc_sys::{mi_process_info, mi_stats_merge};
 
 	unsafe extern "C" {
+		// `libmimalloc-sys` exposes most of the extended API we use, but it does
+		// not currently bind `mi_stats_get`.
 		fn mi_stats_get(stats_size: usize, stats: *mut MiStats);
-		fn mi_stats_merge();
 	}
 
 	let mut stats = MiStats {
@@ -599,6 +668,18 @@ mod tests {
 	}
 
 	#[test]
+	fn collect_reports_undeclared_allocator_as_error() {
+		let _guard = TEST_GUARD.lock();
+		configure(AllocatorKind::Undeclared);
+
+		let err = collect().expect_err("undeclared allocator should fail collect");
+		assert_eq!(
+			err.to_string(),
+			"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
+		);
+	}
+
+	#[test]
 	fn prometheus_collector_emits_allocator_info_metric() {
 		let _guard = TEST_GUARD.lock();
 		configure(AllocatorKind::Glibc);
@@ -644,6 +725,13 @@ mod tests {
 		assert_eq!(comparable.mapped_bytes, Some(4608));
 		assert_eq!(comparable.retained_bytes, Some(1024));
 		assert_eq!(comparable.allocator_structures, Some(3));
+	}
+
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[test]
+	fn glibc_collect_succeeds() {
+		let _guard = TEST_GUARD.lock();
+		collect_for(AllocatorKind::Glibc).expect("glibc collection should succeed");
 	}
 
 	#[cfg(feature = "allocator-mimalloc")]
