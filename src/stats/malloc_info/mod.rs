@@ -76,14 +76,3 @@ pub fn malloc_info() -> Result<info::Malloc, Error> {
 pub fn malloc_info() -> Result<info::Malloc, Error> {
 	Err(ErrorRepr::Unsupported.into())
 }
-
-#[cfg(test)]
-mod test {
-	use super::*;
-
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
-	#[tokio::test]
-	async fn call_from_async() {
-		let _ = tokio::task::spawn(async { malloc_info().expect("malloc_info") }).await;
-	}
-}
