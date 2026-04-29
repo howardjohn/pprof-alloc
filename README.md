@@ -222,7 +222,3 @@ Those differences are where fragmentation, retention, cached pages, and allocato
 - `src/pprof/`: profile encoding and mapping/build ID discovery
 - `src/stats/`: Linux memory and allocator stats
 - `examples/allocation_patterns.rs`: example workload
-
-## Roadmap
-
-See [ROADMAP.md](./ROADMAP.md) for the concrete work plan.

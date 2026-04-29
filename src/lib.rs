@@ -1,3 +1,16 @@
+//! Allocation profiling and Linux memory telemetry for Rust services.
+//!
+//! `pprof-alloc` provides a [`GlobalAlloc`] wrapper that can sample allocation
+//! stack traces and export them as gzipped pprof heap profiles. It also exposes
+//! Linux memory collectors for allocator state, cgroup v2 memory accounting, and
+//! `/proc/self/smaps_rollup` process residency.
+//!
+//! The crate is intended to be embedded in binaries that expose their own debug
+//! or metrics endpoint. Use [`PprofAlloc`] as the process global allocator, then
+//! call [`generate_pprof`] or [`snapshot`] from your application surface.
+//!
+//! [`GlobalAlloc`]: std::alloc::GlobalAlloc
+
 pub mod allocator;
 mod pprof;
 pub mod stats;
