@@ -62,9 +62,6 @@ pub fn malloc_info() -> Result<info::Malloc, Error> {
 			}
 		}
 
-		//  let mut buf = vec![];
-		//  cursor.read_to_end(&mut buf).unwrap();
-		// println!("howardjohn: {}", String::from_utf8_lossy(&buf));
 		Ok(quick_xml::de::from_reader(&mut cursor)?)
 	}
 	malloc_info().map_err(Error::from)
