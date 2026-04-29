@@ -140,17 +140,21 @@ fn test_vmflags_from_str() {
 	assert_eq!(VmFlags::from_str("a b c d"), Default::default());
 
 	// Check enabling some subset of flags
-	let mut flags: VmFlags = Default::default();
-	flags.rd = true;
-	flags.de = true;
-	flags.uw = true;
+	let flags = VmFlags {
+		rd: true,
+		de: true,
+		uw: true,
+		..Default::default()
+	};
 	assert_eq!(VmFlags::from_str("rd de uw"), flags);
 
 	// Check that the order of flags doesn't matter
-	let mut flags: VmFlags = Default::default();
-	flags.rd = true;
-	flags.de = true;
-	flags.uw = true;
+	let flags = VmFlags {
+		rd: true,
+		de: true,
+		uw: true,
+		..Default::default()
+	};
 	assert_eq!(VmFlags::from_str("uw rd de"), flags);
 }
 
@@ -428,10 +432,12 @@ MMUPageSize:           4 kB
 VmFlags:
 ";
 
-	let mut perms: Permissions = Default::default();
-	perms.read = true;
-	perms.write = true;
-	perms.private = true;
+	let perms = Permissions {
+		read: true,
+		write: true,
+		private: true,
+		..Default::default()
+	};
 
 	assert_eq!(
 		from_str(txt),

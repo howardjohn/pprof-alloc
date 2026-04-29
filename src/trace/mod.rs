@@ -1,3 +1,14 @@
+#[cfg(not(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+use backtrace::trace;
+#[cfg(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use frame_pointer::trace;
 
 use itertools::Itertools;
@@ -6,6 +17,17 @@ use smallvec::SmallVec;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+#[cfg(not(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+mod backtrace;
+#[cfg(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod frame_pointer;
 
 const SOFT_MAX_DEPTH: usize = 128;
@@ -13,10 +35,25 @@ const SOFT_MAX_DEPTH: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum CaptureMode {
 	FramePointer,
+	Backtrace,
 }
 
+#[cfg(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub const fn capture_mode() -> CaptureMode {
 	CaptureMode::FramePointer
+}
+
+#[cfg(not(all(
+	feature = "frame-pointer",
+	target_os = "linux",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub const fn capture_mode() -> CaptureMode {
+	CaptureMode::Backtrace
 }
 
 #[derive(Clone)]

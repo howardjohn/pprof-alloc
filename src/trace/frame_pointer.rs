@@ -12,17 +12,38 @@ pub fn trace() -> super::UnresolvedFrames {
 	let mut pc = 0;
 	let mut fp = 0;
 	unsafe {
-		asm!("lea {}, [rip]", out(reg) pc);
-		asm!("mov {}, rbp", out(reg) fp);
+		#[cfg(target_arch = "x86_64")]
+		{
+			asm!("lea {}, [rip]", out(reg) pc);
+			asm!("mov {}, rbp", out(reg) fp);
+		}
+
+		#[cfg(target_arch = "aarch64")]
+		{
+			asm!("adr {}, .", out(reg) pc);
+			asm!("mov {}, x29", out(reg) fp);
+		}
 	}
 	bt.push(pc);
 	while fp != 0 {
 		pc = load::<u64>(fp + 8);
-		pc -= 1;
+		pc = return_address_to_call_pc(pc);
 		bt.push(pc);
 		fp = load::<u64>(fp);
 	}
 	bt.into()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn return_address_to_call_pc(pc: u64) -> u64 {
+	pc - 1
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn return_address_to_call_pc(pc: u64) -> u64 {
+	pc - 4
 }
 
 #[inline]

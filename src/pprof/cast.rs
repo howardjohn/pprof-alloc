@@ -154,41 +154,6 @@ cast_from!(i32, i128);
 cast_from!(i64, i64);
 cast_from!(i64, i128);
 
-/// A trait for attempted casts.
-///
-/// `TryCast` is like `as`, but returns `None` if
-/// the conversion can't be round-tripped.
-///
-/// Note: there may be holes in the domain of `try_cast_from`,
-/// which is probably why `TryFrom` wasn't implemented for floats in the
-/// standard library. For example, `i64::MAX` can be converted to
-/// `f64`, but `i64::MAX - 1` can't.
-pub trait TryCastFrom<T>: Sized {
-	/// Attempts to perform the cast
-	fn try_cast_from(from: T) -> Option<Self>;
-}
-
-/// Implement `TryCastFrom` for the specified types.
-/// This is only necessary for types for which `as` exists,
-/// but `TryFrom` doesn't (notably floats).
-macro_rules! try_cast_from {
-	($from:ty, $to:ty) => {
-		impl crate::pprof::cast::TryCastFrom<$from> for $to {
-			#[allow(clippy::as_conversions)]
-			fn try_cast_from(from: $from) -> Option<$to> {
-				let to = from as $to;
-				let inverse = to as $from;
-				if from == inverse { Some(to) } else { None }
-			}
-		}
-	};
-}
-
-try_cast_from!(f64, i64);
-try_cast_from!(i64, f64);
-try_cast_from!(f64, u64);
-try_cast_from!(u64, f64);
-
 /// A wrapper type which ensures a signed number is non-negative.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(transparent)]

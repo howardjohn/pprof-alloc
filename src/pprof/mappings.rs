@@ -18,12 +18,15 @@
 //! Utility crate to extract information about the running process.
 //!
 //! Currently only works on Linux.
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 use once_cell::sync::Lazy;
 use tracing::error;
 
-use super::{BuildId, Mapping};
+#[cfg(target_os = "linux")]
+use super::BuildId;
+use super::Mapping;
 
 #[cfg(target_os = "linux")]
 mod enabled {
@@ -316,7 +319,6 @@ pub static MAPPINGS: Lazy<Option<Vec<Mapping>>> = Lazy::new(|| {
 				mappings.push(Mapping {
 					memory_start,
 					memory_end: memory_start + segment.memory_size,
-					memory_offset: segment.memory_offset,
 					file_offset: segment.file_offset,
 					pathname: object.path_name.clone(),
 					build_id: object.build_id.clone(),
@@ -343,6 +345,7 @@ pub static MAPPINGS: Lazy<Option<Vec<Mapping>>> = Lazy::new(|| {
 });
 
 /// Information about a shared object loaded into the current process.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SharedObject {
 	/// The address at which the object is loaded.
@@ -356,6 +359,7 @@ pub struct SharedObject {
 }
 
 /// A segment of a shared object that's loaded into memory.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LoadedSegment {
 	/// Offset of the segment in the source file.

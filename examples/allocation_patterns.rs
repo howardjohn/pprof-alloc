@@ -263,10 +263,11 @@ fn mixed_allocation_patterns() {
 		let _binary_data = vec![i as u8; 256];
 
 		// Allocate a small struct
-		let _small_struct = SmallStruct {
+		let small_struct = SmallStruct {
 			id: i,
 			data: vec![i; 32],
 		};
+		let _ = small_struct.id + small_struct.data.len();
 	}
 }
 
@@ -280,6 +281,7 @@ fn create_long_lived_allocations() -> Vec<LongLivedData> {
 			metadata: format!("Metadata for item {}", i),
 			counters: vec![0; 100],
 		};
+		let _ = item.id + item.buffer.len() + item.metadata.len() + item.counters.len();
 		data.push(item);
 	}
 
@@ -326,11 +328,13 @@ fn nested_call_stacks() {
 fn level1() {
 	level2();
 	let _alloc1 = vec![0u8; 100];
+	let _ = _alloc1.capacity();
 }
 
 fn level2() {
 	level3();
 	let _alloc2 = vec![1u8; 200];
+	let _ = _alloc2.capacity();
 }
 
 fn level3() {

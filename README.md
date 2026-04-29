@@ -25,10 +25,10 @@ What exists today:
 
 What is still incomplete:
 
-- Deallocations are not yet applied to stack attribution, so the exported `pprof` data is cumulative allocated bytes by stack, not true live heap ownership.
-- The allocator wrapper currently wraps `std::alloc::System`; it is not yet a generic adapter for glibc, jemalloc, and mimalloc.
+- Stack-attributed profiles include cumulative allocated bytes and estimated live heap ownership, but they depend on sampled allocation tracking rather than allocator-native heap iteration.
+- The allocator wrapper can wrap any `GlobalAlloc`, while allocator-specific stats and collection are currently implemented for declared glibc, jemalloc, and mimalloc backends.
 - The crate is intended to be embedded in a binary that exposes HTTP/debug endpoints; the library itself does not need to own the HTTP surface.
-- The Linux stats are strongest on glibc-based environments; non-Linux support is limited.
+- The Linux memory stats are Linux-only; stack capture uses a fast default `frame-pointer` feature on Linux x86_64/aarch64 and a slower `backtrace` fallback elsewhere.
 
 ## Why this exists
 
@@ -55,7 +55,7 @@ The current crate has three main pieces:
 1. Allocation tracing
 
 - `PprofAlloc` wraps the global allocator and records backtraces on allocation.
-- Stack capture uses a manual frame-pointer walk.
+- Stack capture uses a manual frame-pointer walk when the default `frame-pointer` feature is active on Linux x86_64/aarch64, and the `backtrace` crate elsewhere.
 
 2. pprof export
 
@@ -79,6 +79,26 @@ static GLOBAL: pprof_alloc::PprofAlloc =
 
 pprof_alloc::declare_allocator_kind!(pprof_alloc::allocator::AllocatorKind::Glibc);
 ```
+
+`with_pprof()` samples allocations the same way Go's heap profiler does by default:
+one sampled allocation per `512 KiB` of allocated bytes on average. Use
+`with_pprof_sample_rate(1)` to record every allocation, or `with_pprof_sample_rate(0)`
+to disable pprof recording while still allowing other allocator stats.
+
+The sample rate can also be deferred to an environment variable while keeping the
+global allocator initializer const:
+
+```rust
+#[global_allocator]
+static GLOBAL: pprof_alloc::PprofAlloc =
+    pprof_alloc::PprofAlloc::new()
+        .with_pprof_sample_rate_from_env(pprof_alloc::DEFAULT_PPROF_SAMPLE_RATE)
+        .with_stats();
+```
+
+Set `PPROF_ALLOC_SAMPLE_RATE` before process startup. The value is read lazily on
+the first profiled allocation; missing or invalid values fall back to the default
+passed to `with_pprof_sample_rate_from_env`.
 
 Or wrap a different allocator directly:
 
@@ -150,16 +170,19 @@ cargo run --example allocation_patterns
 
 ## Frame-pointer mode
 
-Frame-pointer unwinding requires frame pointers to be preserved:
+On Linux x86_64 and Linux aarch64, stack capture uses a manual frame-pointer
+walk. That mode requires frame pointers to be preserved:
 
 ```bash
-cargo run --example allocation_patterns
+RUSTFLAGS=-Cforce-frame-pointers=yes cargo run --example allocation_patterns
 ```
 
 Current caveats:
 
 - This is the intended fast path for stack capture.
-- The frame-pointer unwinder is architecture-specific.
+- The fast path is controlled by the default `frame-pointer` feature.
+- Build with `default-features = false` to force the slower `backtrace` crate fallback, even on Linux x86_64/aarch64.
+- Non-Linux targets and unsupported architectures use the slower `backtrace` crate fallback regardless of features.
 - It assumes a valid frame-pointer chain and does not yet have defensive bounds checking.
 
 You can check the active unwinder at runtime with:
@@ -170,7 +193,7 @@ println!("{:?}", pprof_alloc::capture_mode());
 
 ## Benchmarking Capture Overhead
 
-The repo includes a simple allocation benchmark for the frame-pointer unwinder:
+The repo includes a simple allocation benchmark for the active unwinder:
 
 ```bash
 cargo run --example capture_benchmark
@@ -193,8 +216,10 @@ Those differences are where fragmentation, retention, cached pages, and allocato
 
 - Linux-first implementation.
 - `malloc_info` requires glibc and only reflects glibc allocator state.
-- Stack capture assumes frame pointers are present and valid.
-- There is no sampling, rate limiting, or production-tuned overhead model yet.
+- Fast stack capture on Linux x86_64 and Linux aarch64 assumes frame pointers are present and valid; disable default features or use other targets to use the slower fallback unwinder.
+- Sampling is process-wide for the active global allocator and assumes the rate is
+  effectively constant for a captured profile, matching pprof's heap profile
+  model.
 
 ## Repository layout
 

@@ -39,7 +39,7 @@ pub fn rollup() -> anyhow::Result<ProcessStats> {
 }
 
 fn parse_rollup(input: &str) -> anyhow::Result<ProcessStats> {
-	let smaps = super::procmaps::from_str(&input).expect("library never returns None");
+	let smaps = super::procmaps::from_str(input).expect("library never returns None");
 	if smaps.len() != 1 {
 		return Err(anyhow::anyhow!(
 			"Expected 1 smaps entry, got {}",

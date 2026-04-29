@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -15,15 +15,7 @@ use prost::Message;
 use smallvec::SmallVec;
 
 pub use cast::CastFrom;
-pub use cast::TryCastFrom;
 pub use mappings::MAPPINGS;
-
-/// Start times of the profiler.
-#[derive(Copy, Clone, Debug)]
-pub enum ProfStartTime {
-	Instant(Instant),
-	TimeImmemorial,
-}
 
 /// Helper struct to simplify building a `string_table` for the pprof format.
 #[derive(Default)]
@@ -65,7 +57,6 @@ pub struct WeightedStack {
 pub struct Mapping {
 	pub memory_start: usize,
 	pub memory_end: usize,
-	pub memory_offset: usize,
 	pub file_offset: u64,
 	pub pathname: PathBuf,
 	pub build_id: Option<BuildId>,
@@ -94,17 +85,14 @@ pub struct StackProfile {
 }
 
 impl StackProfile {
-	/// Converts the profile into the pprof format.
-	///
-	/// pprof encodes profiles as gzipped protobuf messages of the Profile message type
-	/// (see `pprof/profile.proto`).
-	pub fn to_pprof(
+	pub fn to_pprof_with_period(
 		&self,
 		sample_types: &[(&str, &str)],
 		period_type: (&str, &str),
+		period: i64,
 		anno_key: Option<String>,
 	) -> Vec<u8> {
-		let profile = self.to_pprof_proto(sample_types, period_type, anno_key);
+		let profile = self.to_pprof_proto(sample_types, period_type, period, anno_key);
 		let encoded = profile.encode_to_vec();
 
 		let mut gz = GzEncoder::new(Vec::new(), Compression::default());
@@ -117,6 +105,7 @@ impl StackProfile {
 		&self,
 		sample_types: &[(&str, &str)],
 		period_type: (&str, &str),
+		period: i64,
 		anno_key: Option<String>,
 	) -> proto::Profile {
 		assert!(
@@ -141,6 +130,7 @@ impl StackProfile {
 			r#type: strings.insert(period_type.0),
 			unit: strings.insert(period_type.1),
 		});
+		profile.period = period;
 		profile.default_sample_type = strings.insert(sample_types.last().unwrap().0);
 
 		profile.time_nanos = SystemTime::now()
@@ -322,10 +312,6 @@ impl StackProfile {
 		self.stacks.push((stack, anno_idx))
 	}
 
-	pub fn push_mapping(&mut self, mapping: Mapping) {
-		self.mappings.push(mapping);
-	}
-
 	pub fn iter(&self) -> StackProfileIter<'_> {
 		StackProfileIter {
 			inner: self,
@@ -352,9 +338,10 @@ mod tests {
 			None,
 		);
 
-		let encoded = profile.to_pprof(
+		let encoded = profile.to_pprof_with_period(
 			&[("alloc_space", "bytes"), ("inuse_space", "bytes")],
 			("space", "bytes"),
+			0,
 			None,
 		);
 
@@ -383,7 +370,8 @@ mod tests {
 			None,
 		);
 
-		let encoded = profile.to_pprof(&[("inuse_space", "bytes")], ("space", "bytes"), None);
+		let encoded =
+			profile.to_pprof_with_period(&[("inuse_space", "bytes")], ("space", "bytes"), 0, None);
 
 		let mut decoder = GzDecoder::new(encoded.as_slice());
 		let mut decoded_bytes = Vec::new();
