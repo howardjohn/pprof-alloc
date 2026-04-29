@@ -1,4 +1,3 @@
-use crate::Probe;
 use crate::stats;
 use anyhow::Result;
 use prometheus_client::collector::Collector;
@@ -21,8 +20,8 @@ pub enum AllocatorKind {
 #[derive(Clone, Debug, Serialize)]
 pub struct AllocatorSnapshot {
 	pub kind: AllocatorKind,
-	pub comparable: Probe<AllocatorComparisonStats>,
-	pub specific: Probe<AllocatorSpecificDetails>,
+	pub comparable: Option<AllocatorComparisonStats>,
+	pub specific: Option<AllocatorSpecificDetails>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +63,7 @@ impl Collector for PrometheusCollector {
 			Ok(())
 		};
 
-		let Some(comparable) = snapshot.comparable.value.as_ref() else {
+		let Some(comparable) = snapshot.comparable.as_ref() else {
 			return Ok(());
 		};
 
@@ -339,21 +338,6 @@ pub fn configured() -> AllocatorKind {
 	AllocatorKind::from_u8(CONFIGURED_ALLOCATOR.load(Ordering::Acquire))
 }
 
-pub fn collect() -> Result<()> {
-	collect_for(configured())
-}
-
-pub fn collect_for(kind: AllocatorKind) -> Result<()> {
-	match kind {
-		AllocatorKind::Undeclared => anyhow::bail!(
-			"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
-		),
-		AllocatorKind::Glibc => glibc_collect(),
-		AllocatorKind::Jemalloc => jemalloc_collect(),
-		AllocatorKind::Mimalloc => mimalloc_collect(true),
-	}
-}
-
 pub fn snapshot() -> AllocatorSnapshot {
 	snapshot_for(configured())
 }
@@ -387,16 +371,13 @@ fn backend_snapshot(
 	match result {
 		Ok((comparable, specific)) => AllocatorSnapshot {
 			kind,
-			comparable: Probe::ok(comparable),
-			specific: Probe::ok(specific),
+			comparable: Some(comparable),
+			specific: Some(specific),
 		},
-		Err(error) => {
-			let message = error.to_string();
-			AllocatorSnapshot {
-				kind,
-				comparable: Probe::err(&message),
-				specific: Probe::err(message),
-			}
+		Err(_) => AllocatorSnapshot {
+			kind,
+			comparable: None,
+			specific: None,
 		},
 	}
 }
@@ -405,19 +386,6 @@ fn glibc_snapshot() -> Result<GlibcStats> {
 	stats::malloc::info()
 		.map(|info| GlibcStats::from(&info))
 		.map_err(anyhow::Error::from)
-}
-
-fn glibc_collect() -> Result<()> {
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
-	{
-		stats::malloc::malloc_trim();
-		Ok(())
-	}
-
-	#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-	{
-		anyhow::bail!("glibc collection is only supported on linux-gnu targets")
-	}
 }
 
 #[cfg(feature = "allocator-jemalloc")]
@@ -431,33 +399,6 @@ fn jemalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecif
 
 #[cfg(not(feature = "allocator-jemalloc"))]
 fn jemalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecificDetails)> {
-	anyhow::bail!("jemalloc support is not compiled in; enable the `allocator-jemalloc` feature")
-}
-
-#[cfg(feature = "allocator-jemalloc")]
-fn jemalloc_collect() -> Result<()> {
-	use tikv_jemalloc_ctl::{arenas, raw};
-
-	unsafe {
-		// Cached thread-local objects need to be released before arena purge has
-		// a chance to return pages to the OS.
-		let _ = raw::write::<()>(b"thread.tcache.flush\0", ());
-	}
-
-	let narenas = arenas::narenas::read().map_err(anyhow::Error::from)?;
-	let mut purge_mib = [0; 3];
-	raw::name_to_mib(b"arena.0.purge\0", &mut purge_mib).map_err(anyhow::Error::from)?;
-	for arena in 0..narenas {
-		purge_mib[1] = arena as usize;
-		unsafe {
-			raw::write_mib::<()>(&purge_mib, ()).map_err(anyhow::Error::from)?;
-		}
-	}
-	Ok(())
-}
-
-#[cfg(not(feature = "allocator-jemalloc"))]
-fn jemalloc_collect() -> Result<()> {
 	anyhow::bail!("jemalloc support is not compiled in; enable the `allocator-jemalloc` feature")
 }
 
@@ -489,19 +430,6 @@ fn mimalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecif
 
 #[cfg(not(feature = "allocator-mimalloc"))]
 fn mimalloc_snapshot_pair() -> Result<(AllocatorComparisonStats, AllocatorSpecificDetails)> {
-	anyhow::bail!("mimalloc support is not compiled in; enable the `allocator-mimalloc` feature")
-}
-
-#[cfg(feature = "allocator-mimalloc")]
-pub fn mimalloc_collect(force: bool) -> Result<()> {
-	unsafe {
-		libmimalloc_sys::mi_collect(force);
-	}
-	Ok(())
-}
-
-#[cfg(not(feature = "allocator-mimalloc"))]
-pub fn mimalloc_collect(_force: bool) -> Result<()> {
 	anyhow::bail!("mimalloc support is not compiled in; enable the `allocator-mimalloc` feature")
 }
 
@@ -651,32 +579,14 @@ mod tests {
 	static TEST_GUARD: Mutex<()> = Mutex::new(());
 
 	#[test]
-	fn snapshot_reports_undeclared_allocator_as_error() {
+	fn snapshot_reports_undeclared_allocator_without_stats() {
 		let _guard = TEST_GUARD.lock();
 		configure(AllocatorKind::Undeclared);
 
 		let snapshot = snapshot();
 		assert_eq!(snapshot.kind, AllocatorKind::Undeclared);
-		assert!(snapshot.comparable.value.is_none());
-		assert!(snapshot.specific.value.is_none());
-		assert_eq!(
-			snapshot.comparable.error.as_deref(),
-			Some(
-				"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
-			)
-		);
-	}
-
-	#[test]
-	fn collect_reports_undeclared_allocator_as_error() {
-		let _guard = TEST_GUARD.lock();
-		configure(AllocatorKind::Undeclared);
-
-		let err = collect().expect_err("undeclared allocator should fail collect");
-		assert_eq!(
-			err.to_string(),
-			"allocator kind is undeclared; add declare_allocator_kind!(...) next to #[global_allocator]"
-		);
+		assert!(snapshot.comparable.is_none());
+		assert!(snapshot.specific.is_none());
 	}
 
 	#[test]
@@ -725,13 +635,6 @@ mod tests {
 		assert_eq!(comparable.mapped_bytes, Some(4608));
 		assert_eq!(comparable.retained_bytes, Some(1024));
 		assert_eq!(comparable.allocator_structures, Some(3));
-	}
-
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
-	#[test]
-	fn glibc_collect_succeeds() {
-		let _guard = TEST_GUARD.lock();
-		collect_for(AllocatorKind::Glibc).expect("glibc collection should succeed");
 	}
 
 	#[cfg(feature = "allocator-mimalloc")]

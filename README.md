@@ -134,12 +134,6 @@ let snapshot = pprof_alloc::snapshot();
 let json = serde_json::to_string_pretty(&snapshot)?;
 ```
 
-Ask the active allocator to return reclaimable memory to the OS:
-
-```rust
-pprof_alloc::collect()?;
-```
-
 The allocator section of the snapshot is split into:
 
 - `comparable`: normalized cross-allocator fields for head-to-head comparison

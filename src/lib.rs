@@ -14,7 +14,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use crate::trace::CaptureMode;
 
+/// Default average number of allocated bytes between recorded pprof samples.
+///
+/// This matches Go's default heap profiling rate: one sampled allocation per
+/// 512 KiB of allocated bytes on average. A rate of `1` records every
+/// allocation, while `0` disables pprof stack recording.
 pub const DEFAULT_PPROF_SAMPLE_RATE: usize = 512 * 1024;
+
+/// Environment variable read by [`PprofAlloc::with_pprof_sample_rate_from_env`].
+///
+/// The value must be an unsigned integer byte rate. Missing or invalid values
+/// use the default passed to `with_pprof_sample_rate_from_env`.
 pub const PPROF_SAMPLE_RATE_ENV: &str = "PPROF_ALLOC_SAMPLE_RATE";
 
 const PPROF_SAMPLE_RATE_ENV_CSTR: &[u8] = b"PPROF_ALLOC_SAMPLE_RATE\0";
@@ -24,6 +34,11 @@ const ENV_SAMPLE_RATE_UNINITIALIZED: u8 = 0;
 const ENV_SAMPLE_RATE_SET: u8 = 1;
 const ENV_SAMPLE_RATE_UNSET: u8 = 2;
 
+/// Global allocator wrapper that can collect allocation counters and pprof heap profiles.
+///
+/// Use this as a `#[global_allocator]` around [`std::alloc::System`] or another
+/// allocator implementing [`GlobalAlloc`]. Profiling and coarse allocation
+/// counters are opt-in through the builder methods.
 pub struct PprofAlloc<A = System> {
 	inner: A,
 	/// Enable profiling support
@@ -92,59 +107,46 @@ fn scale_heap_sample(count: u64, size: u64, sample_rate: usize) -> (i64, i64) {
 	)
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Probe<T> {
-	pub value: Option<T>,
-	pub error: Option<String>,
-}
-
-impl<T> Probe<T> {
-	pub(crate) fn ok(value: T) -> Self {
-		Self {
-			value: Some(value),
-			error: None,
-		}
-	}
-
-	pub(crate) fn err(error: impl ToString) -> Self {
-		Self {
-			value: None,
-			error: Some(error.to_string()),
-		}
-	}
-}
-
-impl<T, E> From<Result<T, E>> for Probe<T>
-where
-	E: std::fmt::Display,
-{
-	fn from(result: Result<T, E>) -> Self {
-		match result {
-			Ok(value) => Self::ok(value),
-			Err(error) => Self::err(error),
-		}
-	}
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+/// Summary of the currently recorded pprof allocation profile.
+///
+/// Values are scaled according to the active pprof sample rate, so they are
+/// estimates when sampling is enabled.
 pub struct PprofSummary {
+	/// Number of distinct stack traces recorded in the profile.
 	pub total_stacks: u64,
+	/// Number of distinct stack traces with estimated live bytes greater than zero.
 	pub live_stacks: u64,
+	/// Estimated cumulative allocated bytes across all recorded stacks.
 	pub alloc_space_bytes: u64,
+	/// Estimated currently live bytes across all recorded stacks.
 	pub inuse_space_bytes: u64,
+	/// Estimated cumulative allocation count across all recorded stacks.
 	pub alloc_objects: u64,
+	/// Estimated currently live allocation count across all recorded stacks.
 	pub inuse_objects: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Best-effort snapshot of allocation and memory state for the current process created by `snapshot()`.
+///
+/// Snapshot collection never fails as a whole. Optional fields are `None` when
+/// the corresponding operating-system or allocator probe is unavailable.
 pub struct MemorySnapshot {
+	/// Wall-clock capture time as milliseconds since the Unix epoch.
 	pub captured_at_unix_ms: u64,
+	/// Stack capture implementation compiled into this build.
 	pub capture_mode: CaptureMode,
+	/// Coarse process-wide counters from [`allocation_stats`].
 	pub allocation_stats: stats::Allocations,
+	/// Summary of recorded pprof stack-attributed allocation data.
 	pub pprof: PprofSummary,
+	/// Active allocator identity and allocator-specific memory stats, if available.
 	pub allocator: allocator::AllocatorSnapshot,
-	pub cgroup: Probe<stats::cgroups::MemoryStat>,
-	pub smaps: Probe<stats::smaps::ProcessStats>,
+	/// cgroup v2 memory stats for this process, when available.
+	pub cgroup: Option<stats::cgroups::MemoryStat>,
+	/// `/proc/self/smaps_rollup` memory stats for this process, when available.
+	pub smaps: Option<stats::smaps::ProcessStats>,
 }
 
 impl Default for PprofAlloc<System> {
@@ -154,12 +156,17 @@ impl Default for PprofAlloc<System> {
 }
 
 impl PprofAlloc<System> {
+	/// Create a wrapper around [`std::alloc::System`] with profiling disabled.
+	///
+	/// Use [`Self::with_pprof`], [`Self::with_pprof_sample_rate`], or
+	/// [`Self::with_stats`] to enable collection.
 	pub const fn new() -> Self {
 		Self::from_allocator(System)
 	}
 }
 
 impl<A> PprofAlloc<A> {
+	/// Create a wrapper around a custom allocator with profiling disabled.
 	pub const fn from_allocator(inner: A) -> Self {
 		PprofAlloc {
 			inner,
@@ -170,11 +177,16 @@ impl<A> PprofAlloc<A> {
 		}
 	}
 
+	/// Enable sampled pprof stack profiling using [`DEFAULT_PPROF_SAMPLE_RATE`].
 	pub const fn with_pprof(mut self) -> Self {
 		self.pprof = true;
 		self
 	}
 
+	/// Enable sampled pprof stack profiling with an explicit byte sample rate.
+	///
+	/// A rate of `1` records every allocation. A rate of `0` disables pprof
+	/// stack recording while still allowing other enabled collectors to run.
 	pub const fn with_pprof_sample_rate(mut self, bytes: usize) -> Self {
 		self.pprof = true;
 		self.pprof_sample_rate = bytes;
@@ -182,6 +194,10 @@ impl<A> PprofAlloc<A> {
 		self
 	}
 
+	/// Enable pprof stack profiling with the sample rate read from the environment.
+	///
+	/// [`PPROF_SAMPLE_RATE_ENV`] is read lazily on the first profiled allocation.
+	/// If the variable is missing or invalid, `default_rate` is used.
 	pub const fn with_pprof_sample_rate_from_env(mut self, default_rate: usize) -> Self {
 		self.pprof = true;
 		self.pprof_sample_rate = default_rate;
@@ -189,6 +205,7 @@ impl<A> PprofAlloc<A> {
 		self
 	}
 
+	/// Enable coarse process-wide allocation and free counters.
 	pub const fn with_stats(mut self) -> Self {
 		self.stats = true;
 		self
@@ -237,12 +254,19 @@ impl<A> PprofAlloc<A> {
 		stats.allocations += 1;
 	}
 
-	fn record_deallocation(&self, ptr: usize, size: usize) {
-		let record = if self.pprof && self.effective_pprof_sample_rate() != 0 {
+	fn take_allocation_record(&self, ptr: usize) -> Option<AllocationRecord> {
+		if self.pprof && self.effective_pprof_sample_rate() != 0 {
 			POINTER_MAP.remove(&ptr).map(|(_, record)| record)
 		} else {
 			None
-		};
+		}
+	}
+
+	fn restore_allocation_record(&self, ptr: usize, record: AllocationRecord) {
+		POINTER_MAP.insert(ptr, record);
+	}
+
+	fn finish_deallocation(&self, record: Option<AllocationRecord>, size: usize) {
 		let freed_size = record.as_ref().map(|record| record.size).unwrap_or(size);
 
 		if self.stats {
@@ -261,8 +285,16 @@ impl<A> PprofAlloc<A> {
 		stats.frees += 1;
 	}
 
+	#[cfg(test)]
+	fn record_deallocation(&self, ptr: usize, size: usize) {
+		let record = self.take_allocation_record(ptr);
+		self.finish_deallocation(record, size);
+	}
+
+	#[cfg(test)]
 	fn record_reallocation(&self, old_ptr: usize, old_size: usize, new_ptr: usize, new_size: usize) {
-		self.record_deallocation(old_ptr, old_size);
+		let record = self.take_allocation_record(old_ptr);
+		self.finish_deallocation(record, old_size);
 		self.record_allocation(new_ptr, new_size);
 	}
 }
@@ -293,15 +325,24 @@ lazy_static::lazy_static! {
 	static ref TRACE_MAP: DashMap<HashedBacktrace, stats::Allocations> = DashMap::new();
 }
 
+/// Return a snapshot of coarse process-wide allocation counters.
+///
+/// These counters are updated only when the global allocator wrapper was
+/// configured with [`PprofAlloc::with_stats`].
 pub fn allocation_stats() -> stats::Allocations {
 	GLOBAL_STATS.snapshot()
 }
 
+/// Return the stack capture mode compiled into this build.
+///
+/// Linux x86_64/aarch64 builds use the fast frame-pointer unwinder when the
+/// default `frame-pointer` feature is enabled. Other builds use the `backtrace`
+/// crate fallback.
 pub const fn capture_mode() -> CaptureMode {
 	trace::capture_mode()
 }
 
-pub fn current_pprof_sample_rate() -> usize {
+fn current_pprof_sample_rate() -> usize {
 	CURRENT_PPROF_SAMPLE_RATE.load(Ordering::Relaxed)
 }
 
@@ -429,6 +470,10 @@ fn random_seed() -> u64 {
 	}
 }
 
+/// Capture a best-effort process memory snapshot.
+///
+/// Individual probes that fail are represented as `None` in the returned
+/// [`MemorySnapshot`]. This function intentionally does not fail as a whole.
 pub fn snapshot() -> MemorySnapshot {
 	enter_alloc(|| MemorySnapshot {
 		captured_at_unix_ms: SystemTime::now()
@@ -441,13 +486,9 @@ pub fn snapshot() -> MemorySnapshot {
 		allocation_stats: allocation_stats(),
 		pprof: pprof_summary(),
 		allocator: allocator::snapshot(),
-		cgroup: Probe::from(stats::cgroups::get_stats()),
-		smaps: Probe::from(stats::smaps::rollup()),
+		cgroup: stats::cgroups::get_stats().ok(),
+		smaps: stats::smaps::rollup().ok(),
 	})
-}
-
-pub fn collect() -> anyhow::Result<()> {
-	enter_alloc(allocator::collect)
 }
 
 fn pprof_summary() -> PprofSummary {
@@ -509,8 +550,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 			}
 
 			enter_alloc(|| {
+				let record = self.take_allocation_record(ptr as usize);
 				self.inner.dealloc(ptr, layout);
-				self.record_deallocation(ptr as usize, layout.size());
+				self.finish_deallocation(record, layout.size());
 			});
 		}
 	}
@@ -522,9 +564,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 			}
 
 			enter_alloc(|| {
+				let record = self.take_allocation_record(ptr as usize);
 				let new_ptr = self.inner.realloc(ptr, layout, new_size);
 				if !new_ptr.is_null() {
-					self.record_reallocation(ptr as usize, layout.size(), new_ptr as usize, new_size);
+					self.finish_deallocation(record, layout.size());
+					self.record_allocation(new_ptr as usize, new_size);
+				} else if let Some(record) = record {
+					self.restore_allocation_record(ptr as usize, record);
 				}
 				new_ptr
 			})
