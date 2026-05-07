@@ -1,9 +1,12 @@
 use human_bytes::human_bytes;
 use std::fs;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[global_allocator]
-static GLOBAL: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new().with_pprof().with_stats();
+static GLOBAL: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new()
+	.with_pprof_sample_rate_from_env(1)
+	.with_stats();
 
 fn main() {
 	let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -86,7 +89,11 @@ async fn main_inner() {
 	println!("15. Spawned task allocations...");
 	spawned_task_allocations().await;
 
-	// println!("{:#?}", pprof_alloc::malloc_info());
+	std::fs::File::create("/tmp/pprof")
+		.unwrap()
+		.write(&pprof_alloc::generate_pprof().unwrap())
+		.unwrap();
+	println!("wrote pprof to /tmp/pprof");
 
 	drop(_large_buffer);
 	// pprof_alloc::generate_fragmentation_map().unwrap();

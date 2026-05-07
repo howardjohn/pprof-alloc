@@ -179,6 +179,9 @@ impl StackProfile {
 				// caller return PCs into an instruction address. Preserve that order here because
 				// profile.proto expects location_id[0] to be the leaf frame.
 				let addr = u64::cast_from(*addr);
+				if is_pprof_alloc_internal_frame(addr) {
+					continue;
+				}
 
 				// Find the mapping for this address (search once)
 				let mapping_info = self.mappings.iter().enumerate().find(|(_, mapping)| {
@@ -275,6 +278,22 @@ impl StackProfile {
 
 		profile
 	}
+}
+
+fn is_pprof_alloc_internal_frame(addr: u64) -> bool {
+	let mut internal = false;
+	backtrace::resolve(addr as *mut std::ffi::c_void, |symbol| {
+		let Some(symbol_name) = symbol.name() else {
+			return;
+		};
+		let function_name = format!("{symbol_name:#}");
+		internal |= is_pprof_alloc_internal_function(&function_name);
+	});
+	internal
+}
+
+fn is_pprof_alloc_internal_function(function_name: &str) -> bool {
+	function_name.starts_with("pprof_alloc::")
 }
 
 pub struct StackProfileIter<'a> {
@@ -391,5 +410,18 @@ mod tests {
 			.collect::<Vec<_>>();
 
 		assert_eq!(sample_addrs, vec![0x1000, 0x2000, 0x3000]);
+	}
+
+	#[test]
+	fn pprof_alloc_internal_function_names_are_filtered() {
+		assert!(is_pprof_alloc_internal_function(
+			"pprof_alloc::trace::frame_pointer::trace"
+		));
+		assert!(is_pprof_alloc_internal_function(
+			"pprof_alloc::trace::backtrace::trace"
+		));
+		assert!(!is_pprof_alloc_internal_function(
+			"example::allocation_hot_path"
+		));
 	}
 }
