@@ -177,7 +177,8 @@ Current caveats:
 - The fast path is controlled by the default `frame-pointer` feature.
 - Build with `default-features = false` to force the slower `backtrace` crate fallback, even on Linux x86_64/aarch64.
 - Non-Linux targets and unsupported architectures use the slower `backtrace` crate fallback regardless of features.
-- It assumes a valid frame-pointer chain and does not yet have defensive bounds checking.
+- It performs best-effort stack-bounds and frame-chain validation. Invalid or
+  missing frame pointers may truncate the captured stack.
 
 You can check the active unwinder at runtime with:
 
@@ -210,7 +211,10 @@ Those differences are where fragmentation, retention, cached pages, and allocato
 
 - Linux-first implementation.
 - `malloc_info` requires glibc and only reflects glibc allocator state.
-- Fast stack capture on Linux x86_64 and Linux aarch64 assumes frame pointers are present and valid; disable default features or use other targets to use the slower fallback unwinder.
+- Fast stack capture on Linux x86_64 and Linux aarch64 works best when frame
+  pointers are present and valid. Invalid frame-pointer chains are truncated;
+  disable default features or use other targets to use the slower fallback
+  unwinder.
 - Sampling is process-wide for the active global allocator and assumes the rate is
   effectively constant for a captured profile, matching pprof's heap profile
   model.
