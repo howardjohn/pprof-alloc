@@ -46,6 +46,9 @@ const RANDOM_BIT_COUNT: u32 = 26;
 const ENV_SAMPLE_RATE_UNINITIALIZED: u8 = 0;
 const ENV_SAMPLE_RATE_SET: u8 = 1;
 const ENV_SAMPLE_RATE_UNSET: u8 = 2;
+const RESOLVED_SAMPLE_RATE_UNINITIALIZED: usize = usize::MAX;
+const STATS_FLUSH_EVENTS: u64 = 1024;
+const STATS_FLUSH_BYTES: u64 = 1024 * 1024;
 
 /// Global allocator wrapper that can collect allocation counters and pprof heap profiles.
 ///
@@ -62,6 +65,8 @@ pub struct PprofAlloc<A = System> {
 	pprof_sample_rate: usize,
 	/// Read the pprof sample rate from PPROF_ALLOC_SAMPLE_RATE at runtime.
 	pprof_sample_rate_from_env: bool,
+	/// Cached resolved sample rate for env-driven configuration.
+	resolved_pprof_sample_rate: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -75,6 +80,86 @@ struct HeapSampleValues {
 	alloc_space: i64,
 	inuse_objects: i64,
 	inuse_space: i64,
+}
+
+struct LocalAllocationStats {
+	allocated: Cell<u64>,
+	freed: Cell<u64>,
+	allocations: Cell<u64>,
+	frees: Cell<u64>,
+}
+
+impl LocalAllocationStats {
+	const fn new() -> Self {
+		Self {
+			allocated: Cell::new(0),
+			freed: Cell::new(0),
+			allocations: Cell::new(0),
+			frees: Cell::new(0),
+		}
+	}
+
+	fn record_allocation(&self, size: u64) {
+		self
+			.allocated
+			.set(self.allocated.get().saturating_add(size));
+		self
+			.allocations
+			.set(self.allocations.get().saturating_add(1));
+		self.flush_if_needed();
+	}
+
+	fn record_deallocation(&self, size: u64) {
+		self.freed.set(self.freed.get().saturating_add(size));
+		self.frees.set(self.frees.get().saturating_add(1));
+		self.flush_if_needed();
+	}
+
+	fn flush_if_needed(&self) {
+		let events = self.allocations.get().saturating_add(self.frees.get());
+		let bytes = self.allocated.get().saturating_add(self.freed.get());
+		if events >= STATS_FLUSH_EVENTS || bytes >= STATS_FLUSH_BYTES {
+			self.flush();
+		}
+	}
+
+	fn flush(&self) {
+		let allocated = self.allocated.replace(0);
+		let freed = self.freed.replace(0);
+		let allocations = self.allocations.replace(0);
+		let frees = self.frees.replace(0);
+
+		if allocated != 0 {
+			GLOBAL_STATS
+				.allocated
+				.fetch_add(allocated, Ordering::Relaxed);
+		}
+		if freed != 0 {
+			GLOBAL_STATS.freed.fetch_add(freed, Ordering::Relaxed);
+		}
+		if allocations != 0 {
+			GLOBAL_STATS
+				.allocations
+				.fetch_add(allocations, Ordering::Relaxed);
+		}
+		if frees != 0 {
+			GLOBAL_STATS.frees.fetch_add(frees, Ordering::Relaxed);
+		}
+	}
+
+	#[cfg(test)]
+	fn reset(&self) {
+		self.allocated.set(0);
+		self.freed.set(0);
+		self.allocations.set(0);
+		self.frees.set(0);
+	}
+}
+
+impl Drop for LocalAllocationStats {
+	fn drop(&mut self) {
+		self.flush();
+	}
 }
 
 impl HeapSampleValues {
@@ -187,6 +272,7 @@ impl<A> PprofAlloc<A> {
 			stats: false,
 			pprof_sample_rate: DEFAULT_PPROF_SAMPLE_RATE,
 			pprof_sample_rate_from_env: false,
+			resolved_pprof_sample_rate: AtomicUsize::new(RESOLVED_SAMPLE_RATE_UNINITIALIZED),
 		}
 	}
 
@@ -226,32 +312,85 @@ impl<A> PprofAlloc<A> {
 
 	fn effective_pprof_sample_rate(&self) -> usize {
 		if self.pprof_sample_rate_from_env {
-			env_pprof_sample_rate(self.pprof_sample_rate)
+			let resolved = self.resolved_pprof_sample_rate.load(Ordering::Relaxed);
+			if resolved != RESOLVED_SAMPLE_RATE_UNINITIALIZED {
+				return resolved;
+			}
+
+			let resolved = env_pprof_sample_rate(self.pprof_sample_rate);
+			self
+				.resolved_pprof_sample_rate
+				.store(resolved, Ordering::Relaxed);
+			resolved
 		} else {
 			self.pprof_sample_rate
 		}
 	}
 
-	fn record_allocation(&self, ptr: usize, size: usize) {
-		if self.stats {
-			GLOBAL_STATS
-				.allocated
-				.fetch_add(size as u64, Ordering::Relaxed);
-			GLOBAL_STATS.allocations.fetch_add(1, Ordering::Relaxed);
-		}
-
+	fn active_pprof_sample_rate(&self) -> Option<usize> {
 		if !self.pprof {
-			return;
+			return None;
 		}
 
 		let sample_rate = self.effective_pprof_sample_rate();
 		CURRENT_PPROF_SAMPLE_RATE.store(sample_rate, Ordering::Relaxed);
-		if !should_sample_allocation(size, sample_rate) {
+		(sample_rate != 0).then_some(sample_rate)
+	}
+
+	fn record_allocation_stats(&self, size: usize) {
+		if self.stats {
+			if LOCAL_STATS
+				.try_with(|stats| stats.record_allocation(size as u64))
+				.is_err()
+			{
+				GLOBAL_STATS
+					.allocated
+					.fetch_add(size as u64, Ordering::Relaxed);
+				GLOBAL_STATS.allocations.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+	}
+
+	fn record_deallocation_stats(&self, size: usize) {
+		if self.stats {
+			if LOCAL_STATS
+				.try_with(|stats| stats.record_deallocation(size as u64))
+				.is_err()
+			{
+				GLOBAL_STATS.freed.fetch_add(size as u64, Ordering::Relaxed);
+				GLOBAL_STATS.frees.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+	}
+
+	#[cfg(test)]
+	fn record_allocation(&self, ptr: usize, size: usize) {
+		self.record_allocation_stats(size);
+		if let Some(sample_rate) = self.active_pprof_sample_rate() {
+			self.record_profile_allocation(ptr, size, sample_rate);
+		}
+	}
+
+	fn record_profile_allocation(&self, ptr: usize, size: usize, sample_rate: usize) {
+		if should_sample_allocation(size, sample_rate) {
+			let trace = HashedBacktrace::capture();
+			self.record_allocation_with_trace(ptr, size, trace);
+		}
+	}
+
+	fn record_tracked_allocation(&self, ptr: *mut u8, size: usize, sample_rate: Option<usize>) {
+		if ptr.is_null() {
 			return;
 		}
 
-		let trace = HashedBacktrace::capture();
-		self.record_allocation_with_trace(ptr, size, trace);
+		self.record_allocation_stats(size);
+		if let Some(sample_rate) = sample_rate {
+			self.record_profile_allocation(ptr as usize, size, sample_rate);
+		}
+	}
+
+	fn tracking_is_recursive(&self, sample_rate: Option<usize>) -> bool {
+		(sample_rate.is_some() || self.stats) && IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
 	}
 
 	fn record_allocation_with_trace(&self, ptr: usize, size: usize, trace: HashedBacktrace) {
@@ -281,13 +420,7 @@ impl<A> PprofAlloc<A> {
 
 	fn finish_deallocation(&self, record: Option<AllocationRecord>, size: usize) {
 		let freed_size = record.as_ref().map(|record| record.size).unwrap_or(size);
-
-		if self.stats {
-			GLOBAL_STATS
-				.freed
-				.fetch_add(freed_size as u64, Ordering::Relaxed);
-			GLOBAL_STATS.frees.fetch_add(1, Ordering::Relaxed);
-		}
+		self.record_deallocation_stats(freed_size);
 
 		let Some(record) = record else {
 			return;
@@ -313,10 +446,15 @@ impl<A> PprofAlloc<A> {
 }
 
 fn enter_alloc<T>(func: impl FnOnce() -> T) -> T {
-	let current_value = IN_ALLOC.with(|x| x.get());
-	IN_ALLOC.with(|x| x.set(true));
+	let Ok(current_value) = IN_ALLOC.try_with(|x| {
+		let current_value = x.get();
+		x.set(true);
+		current_value
+	}) else {
+		return func();
+	};
 	let output = func();
-	IN_ALLOC.with(|x| x.set(current_value));
+	let _ = IN_ALLOC.try_with(|x| x.set(current_value));
 	output
 }
 
@@ -326,6 +464,7 @@ thread_local! {
 	static NEXT_SAMPLE: Cell<i64> = const { Cell::new(i64::MIN) };
 	static NEXT_SAMPLE_RATE: Cell<usize> = const { Cell::new(usize::MAX) };
 	static RNG_STATE: Cell<u64> = const { Cell::new(0) };
+	static LOCAL_STATS: LocalAllocationStats = const { LocalAllocationStats::new() };
 }
 
 static GLOBAL_STATS: stats::AtomicAllocations = stats::AtomicAllocations::new();
@@ -343,6 +482,7 @@ lazy_static::lazy_static! {
 /// These counters are updated only when the global allocator wrapper was
 /// configured with [`PprofAlloc::with_stats`].
 pub fn allocation_stats() -> stats::Allocations {
+	let _ = LOCAL_STATS.try_with(|stats| stats.flush());
 	GLOBAL_STATS.snapshot()
 }
 
@@ -411,25 +551,29 @@ fn should_sample_allocation(size: usize, sample_rate: usize) -> bool {
 		return true;
 	}
 
-	NEXT_SAMPLE.with(|next_sample| {
-		NEXT_SAMPLE_RATE.with(|next_sample_rate| {
-			if next_sample_rate.get() != sample_rate {
-				next_sample.set(next_sample_distance(sample_rate));
-				next_sample_rate.set(sample_rate);
-			}
+	NEXT_SAMPLE
+		.try_with(|next_sample| {
+			NEXT_SAMPLE_RATE.try_with(|next_sample_rate| {
+				if next_sample_rate.get() != sample_rate {
+					next_sample.set(next_sample_distance(sample_rate));
+					next_sample_rate.set(sample_rate);
+				}
 
-			let next = next_sample
-				.get()
-				.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
-			if next < 0 {
-				next_sample.set(next_sample_distance(sample_rate));
-				true
-			} else {
-				next_sample.set(next);
-				false
-			}
+				let next = next_sample
+					.get()
+					.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
+				if next < 0 {
+					next_sample.set(next_sample_distance(sample_rate));
+					true
+				} else {
+					next_sample.set(next);
+					false
+				}
+			})
 		})
-	})
+		.ok()
+		.and_then(Result::ok)
+		.unwrap_or(false)
 }
 
 fn next_sample_distance(sample_rate: usize) -> i64 {
@@ -456,17 +600,19 @@ fn cheap_random_n(n: u32) -> u32 {
 }
 
 fn cheap_random() -> u64 {
-	RNG_STATE.with(|state| {
-		let mut x = state.get();
-		if x == 0 {
-			x = random_seed();
-		}
-		x ^= x >> 12;
-		x ^= x << 25;
-		x ^= x >> 27;
-		state.set(x);
-		x.wrapping_mul(0x2545_f491_4f6c_dd1d)
-	})
+	RNG_STATE
+		.try_with(|state| {
+			let mut x = state.get();
+			if x == 0 {
+				x = random_seed();
+			}
+			x ^= x >> 12;
+			x ^= x << 25;
+			x ^= x >> 27;
+			state.set(x);
+			x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+		})
+		.unwrap_or_else(|_| random_seed())
 }
 
 fn random_seed() -> u64 {
@@ -525,15 +671,20 @@ fn pprof_summary() -> PprofSummary {
 unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		unsafe {
-			if IN_ALLOC.with(|x| x.get()) {
+			let sample_rate = self.active_pprof_sample_rate();
+			if self.tracking_is_recursive(sample_rate) {
 				return self.inner.alloc(layout);
+			}
+
+			if sample_rate.is_none() {
+				let ptr = self.inner.alloc(layout);
+				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+				return ptr;
 			}
 
 			enter_alloc(|| {
 				let ptr = self.inner.alloc(layout);
-				if !ptr.is_null() {
-					self.record_allocation(ptr as usize, layout.size());
-				}
+				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
 				ptr
 			})
 		}
@@ -541,15 +692,20 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 
 	unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
 		unsafe {
-			if IN_ALLOC.with(|x| x.get()) {
+			let sample_rate = self.active_pprof_sample_rate();
+			if self.tracking_is_recursive(sample_rate) {
 				return self.inner.alloc_zeroed(layout);
+			}
+
+			if sample_rate.is_none() {
+				let ptr = self.inner.alloc_zeroed(layout);
+				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+				return ptr;
 			}
 
 			enter_alloc(|| {
 				let ptr = self.inner.alloc_zeroed(layout);
-				if !ptr.is_null() {
-					self.record_allocation(ptr as usize, layout.size());
-				}
+				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
 				ptr
 			})
 		}
@@ -557,8 +713,15 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 		unsafe {
-			if IN_ALLOC.with(|x| x.get()) {
+			let sample_rate = self.active_pprof_sample_rate();
+			if self.tracking_is_recursive(sample_rate) {
 				self.inner.dealloc(ptr, layout);
+				return;
+			}
+
+			if sample_rate.is_none() {
+				self.inner.dealloc(ptr, layout);
+				self.record_deallocation_stats(layout.size());
 				return;
 			}
 
@@ -572,8 +735,18 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 
 	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
 		unsafe {
-			if IN_ALLOC.with(|x| x.get()) {
+			let sample_rate = self.active_pprof_sample_rate();
+			if self.tracking_is_recursive(sample_rate) {
 				return self.inner.realloc(ptr, layout, new_size);
+			}
+
+			if sample_rate.is_none() {
+				let new_ptr = self.inner.realloc(ptr, layout, new_size);
+				if !new_ptr.is_null() {
+					self.record_deallocation_stats(layout.size());
+					self.record_allocation_stats(new_size);
+				}
+				return new_ptr;
 			}
 
 			enter_alloc(|| {
@@ -581,7 +754,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 				let new_ptr = self.inner.realloc(ptr, layout, new_size);
 				if !new_ptr.is_null() {
 					self.finish_deallocation(record, layout.size());
-					self.record_allocation(new_ptr as usize, new_size);
+					self.record_tracked_allocation(new_ptr, new_size, sample_rate);
 				} else if let Some(record) = record {
 					self.restore_allocation_record(ptr as usize, record);
 				}
@@ -675,11 +848,12 @@ fn reset_tracking_state() {
 	GLOBAL_STATS.freed.store(0, Ordering::Relaxed);
 	GLOBAL_STATS.allocations.store(0, Ordering::Relaxed);
 	GLOBAL_STATS.frees.store(0, Ordering::Relaxed);
+	let _ = LOCAL_STATS.try_with(|stats| stats.reset());
 	CURRENT_PPROF_SAMPLE_RATE.store(1, Ordering::Relaxed);
 	ENV_PPROF_SAMPLE_RATE_STATE.store(ENV_SAMPLE_RATE_UNINITIALIZED, Ordering::Relaxed);
 	ENV_PPROF_SAMPLE_RATE_VALUE.store(DEFAULT_PPROF_SAMPLE_RATE, Ordering::Relaxed);
-	NEXT_SAMPLE.with(|next_sample| next_sample.set(i64::MIN));
-	NEXT_SAMPLE_RATE.with(|next_sample_rate| next_sample_rate.set(usize::MAX));
+	let _ = NEXT_SAMPLE.try_with(|next_sample| next_sample.set(i64::MIN));
+	let _ = NEXT_SAMPLE_RATE.try_with(|next_sample_rate| next_sample_rate.set(usize::MAX));
 }
 
 #[cfg(test)]
