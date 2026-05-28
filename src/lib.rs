@@ -45,6 +45,7 @@ const STATS_FLUSH_BYTES: u64 = 1024 * 1024;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 enum TrackingMode {
 	Uninitialized = 0,
 	System = 1,
@@ -55,6 +56,7 @@ enum TrackingMode {
 	PprofStats = 6,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl TrackingMode {
 	const fn from_u8(value: u8) -> Self {
 		match value {
@@ -439,6 +441,15 @@ impl PprofAlloc {
 		(sample_rate.is_some() || track_stats) && IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
 	}
 
+	#[cfg(windows)]
+	fn tracking_mode(&self) -> TrackingMode {
+		self
+			.tracking_mode
+			.store(TrackingMode::System as u8, Ordering::Relaxed);
+		TrackingMode::System
+	}
+
+	#[cfg(not(windows))]
 	fn tracking_mode(&self) -> TrackingMode {
 		let mode = TrackingMode::from_u8(self.tracking_mode.load(Ordering::Relaxed));
 		if mode != TrackingMode::Uninitialized {

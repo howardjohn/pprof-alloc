@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use crate::allocator;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -25,7 +26,9 @@ pub const ALLOCATOR_ENV: &str = "PPROF_ALLOC_ALLOCATOR";
 
 const PPROF_SAMPLE_RATE_ENV_CSTR: &[u8] = b"PPROF_ALLOC_SAMPLE_RATE\0";
 const PPROF_BACKEND_ENV_CSTR: &[u8] = b"PPROF_ALLOC_BACKEND\0";
+#[cfg(not(windows))]
 const ALLOCATOR_ENV_CSTR: &[u8] = b"PPROF_ALLOC_ALLOCATOR\0";
+#[cfg(not(windows))]
 const ALLOCATOR_COMPAT_ENV_CSTR: &[u8] = b"ALLOCATOR\0";
 const ENV_SAMPLE_RATE_UNINITIALIZED: usize = usize::MAX;
 const ENV_SAMPLE_RATE_UNSET: usize = usize::MAX - 1;
@@ -61,6 +64,7 @@ pub enum Allocator {
 }
 
 impl Allocator {
+	#[cfg(not(windows))]
 	const fn as_selection(self) -> AllocatorSelection {
 		match self {
 			Self::System => AllocatorSelection::System,
@@ -125,6 +129,13 @@ pub(crate) fn selected_pprof_backend() -> PprofBackend {
 	}
 }
 
+#[cfg(windows)]
+pub(crate) fn selected_allocator(default: Allocator) -> AllocatorSelection {
+	let _ = default;
+	AllocatorSelection::System
+}
+
+#[cfg(not(windows))]
 pub(crate) fn selected_allocator(default: Allocator) -> AllocatorSelection {
 	let selected = AllocatorSelection::from_u8(ENV_ALLOCATOR.load(Ordering::Relaxed));
 	match selected {
@@ -195,6 +206,7 @@ fn read_pprof_backend_env() -> PprofBackend {
 	}
 }
 
+#[cfg(not(windows))]
 fn read_allocator_env_override() -> Option<AllocatorSelection> {
 	let mut ptr = unsafe { libc::getenv(ALLOCATOR_ENV_CSTR.as_ptr().cast()) };
 	if ptr.is_null() {
@@ -220,6 +232,7 @@ fn read_allocator_env_override() -> Option<AllocatorSelection> {
 	Some(AllocatorSelection::System)
 }
 
+#[cfg(not(windows))]
 fn validate_allocator_selection(
 	selection: AllocatorSelection,
 	from_env: bool,
@@ -249,12 +262,21 @@ fn validate_allocator_selection(
 	}
 }
 
+#[cfg(not(windows))]
 fn unavailable_allocator_selected(message: &'static [u8]) -> ! {
 	unsafe {
-		let _ = libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+		write_stderr(message);
 		libc::_exit(1);
 	}
 }
+
+#[cfg(all(unix, not(windows)))]
+unsafe fn write_stderr(message: &'static [u8]) {
+	let _ = unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+}
+
+#[cfg(not(any(unix, windows)))]
+unsafe fn write_stderr(_message: &'static [u8]) {}
 
 fn cstr_eq_ignore_ascii(mut ptr: *const u8, expected: &[u8]) -> bool {
 	for expected_byte in expected {

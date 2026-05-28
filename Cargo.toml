@@ -1,6 +1,6 @@
 [package]
 name = "pprof-alloc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Allocation profiling and Linux memory telemetry for Rust services."
