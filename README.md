@@ -113,6 +113,11 @@ still has per-allocation and sampled-deallocation overhead, so use
 `with_pprof_sample_rate(0)` to disable wrapper pprof recording while still
 allowing other allocator stats.
 
+Wrapper allocation counters are aggregated per thread and flushed periodically
+to reduce hot-path atomic operations. `allocation_stats()` flushes the calling
+thread before reporting, but other live threads may lag by up to 1023 events or
+1 MiB of allocation/free traffic until they flush or exit.
+
 The sample rate can also be deferred to an environment variable while keeping the
 global allocator initializer const:
 

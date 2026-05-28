@@ -10,10 +10,10 @@ pub const PPROF_SAMPLE_RATE_ENV: &str = "PPROF_ALLOC_SAMPLE_RATE";
 /// Environment variable that selects the pprof backend when native jemalloc
 /// profiling support is compiled in.
 ///
-/// Set this before process startup. Supported wrapper value is `wrapper`; any
-/// other value, including an unset variable, selects native jemalloc profiling
-/// when the `allocator-jemalloc` feature is enabled and the active allocator is
-/// jemalloc.
+/// Set this before process startup. Supported wrapper values are `wrapper`,
+/// `pprof-alloc`, and `rust`; any other value, including an unset variable,
+/// selects native jemalloc profiling when the `allocator-jemalloc` feature is
+/// enabled and the active allocator is jemalloc.
 pub const PPROF_BACKEND_ENV: &str = "PPROF_ALLOC_BACKEND";
 
 /// Environment variable read by `PprofAlloc` to select the allocator backend.
@@ -26,6 +26,7 @@ pub const ALLOCATOR_ENV: &str = "PPROF_ALLOC_ALLOCATOR";
 const PPROF_SAMPLE_RATE_ENV_CSTR: &[u8] = b"PPROF_ALLOC_SAMPLE_RATE\0";
 const PPROF_BACKEND_ENV_CSTR: &[u8] = b"PPROF_ALLOC_BACKEND\0";
 const ALLOCATOR_ENV_CSTR: &[u8] = b"PPROF_ALLOC_ALLOCATOR\0";
+const ALLOCATOR_COMPAT_ENV_CSTR: &[u8] = b"ALLOCATOR\0";
 const ENV_SAMPLE_RATE_UNINITIALIZED: usize = usize::MAX;
 const ENV_SAMPLE_RATE_UNSET: usize = usize::MAX - 1;
 
@@ -131,7 +132,8 @@ pub(crate) fn selected_allocator(default: Allocator) -> AllocatorSelection {
 			selected
 		},
 		AllocatorSelection::Uninitialized => {
-			let selected = read_allocator_env_override().unwrap_or_else(|| default.as_selection());
+			let selected = read_allocator_env_override()
+				.unwrap_or_else(|| validate_allocator_selection(default.as_selection(), false));
 			match selected {
 				AllocatorSelection::Jemalloc => allocator::configure(allocator::AllocatorKind::Jemalloc),
 				AllocatorSelection::Mimalloc => allocator::configure(allocator::AllocatorKind::Mimalloc),
@@ -182,7 +184,11 @@ fn read_pprof_backend_env() -> PprofBackend {
 	if ptr.is_null() {
 		return PprofBackend::Native;
 	}
-	if cstr_eq_ignore_ascii(ptr.cast(), b"wrapper") {
+	let ptr = ptr.cast();
+	if cstr_eq_ignore_ascii(ptr, b"wrapper")
+		|| cstr_eq_ignore_ascii(ptr, b"pprof-alloc")
+		|| cstr_eq_ignore_ascii(ptr, b"rust")
+	{
 		PprofBackend::Wrapper
 	} else {
 		PprofBackend::Native
@@ -190,29 +196,57 @@ fn read_pprof_backend_env() -> PprofBackend {
 }
 
 fn read_allocator_env_override() -> Option<AllocatorSelection> {
-	let ptr = unsafe { libc::getenv(ALLOCATOR_ENV_CSTR.as_ptr().cast()) };
+	let mut ptr = unsafe { libc::getenv(ALLOCATOR_ENV_CSTR.as_ptr().cast()) };
+	if ptr.is_null() {
+		ptr = unsafe { libc::getenv(ALLOCATOR_COMPAT_ENV_CSTR.as_ptr().cast()) };
+	}
 	if ptr.is_null() {
 		return None;
 	}
 
 	let ptr = ptr.cast();
 	if cstr_eq_ignore_ascii(ptr, b"jemalloc") {
-		if cfg!(feature = "allocator-jemalloc") {
-			return Some(AllocatorSelection::Jemalloc);
-		}
-		unavailable_allocator_selected(
-			b"PPROF_ALLOC_ALLOCATOR=jemalloc requires the allocator-jemalloc feature\n",
-		);
+		return Some(validate_allocator_selection(
+			AllocatorSelection::Jemalloc,
+			true,
+		));
 	}
 	if cstr_eq_ignore_ascii(ptr, b"mimalloc") {
-		if cfg!(feature = "allocator-mimalloc") {
-			return Some(AllocatorSelection::Mimalloc);
-		}
-		unavailable_allocator_selected(
-			b"PPROF_ALLOC_ALLOCATOR=mimalloc requires the allocator-mimalloc feature\n",
-		);
+		return Some(validate_allocator_selection(
+			AllocatorSelection::Mimalloc,
+			true,
+		));
 	}
 	Some(AllocatorSelection::System)
+}
+
+fn validate_allocator_selection(
+	selection: AllocatorSelection,
+	from_env: bool,
+) -> AllocatorSelection {
+	match selection {
+		AllocatorSelection::Jemalloc if !cfg!(feature = "allocator-jemalloc") => {
+			if from_env {
+				unavailable_allocator_selected(
+					b"PPROF_ALLOC_ALLOCATOR=jemalloc requires the allocator-jemalloc feature\n",
+				);
+			}
+			unavailable_allocator_selected(
+				b"PprofAlloc default allocator jemalloc requires the allocator-jemalloc feature\n",
+			);
+		},
+		AllocatorSelection::Mimalloc if !cfg!(feature = "allocator-mimalloc") => {
+			if from_env {
+				unavailable_allocator_selected(
+					b"PPROF_ALLOC_ALLOCATOR=mimalloc requires the allocator-mimalloc feature\n",
+				);
+			}
+			unavailable_allocator_selected(
+				b"PprofAlloc default allocator mimalloc requires the allocator-mimalloc feature\n",
+			);
+		},
+		selection => selection,
+	}
 }
 
 fn unavailable_allocator_selected(message: &'static [u8]) -> ! {
@@ -240,6 +274,7 @@ pub(crate) fn reset_for_tests() {
 	ENV_ALLOCATOR.store(AllocatorSelection::Uninitialized.as_u8(), Ordering::Relaxed);
 	unsafe {
 		std::env::remove_var(ALLOCATOR_ENV);
+		std::env::remove_var("ALLOCATOR");
 		std::env::remove_var(PPROF_BACKEND_ENV);
 	}
 }

@@ -88,6 +88,13 @@ pub struct StackProfile {
 	pub mappings: Vec<Mapping>,
 }
 
+/// Parsed jemalloc `heap_v2` profile data.
+#[cfg(feature = "allocator-jemalloc")]
+pub(crate) struct JemallocHeapProfile {
+	pub profile: StackProfile,
+	pub sampling_rate: i64,
+}
+
 impl StackProfile {
 	pub fn to_pprof_with_period(
 		&self,
@@ -305,7 +312,7 @@ fn scale_jemalloc_heap_sample(objects: f64, bytes: f64, sampling_rate: f64) -> (
 pub(crate) fn parse_jemalloc_heap_profile<R: BufRead>(
 	r: R,
 	mappings: Vec<Mapping>,
-) -> anyhow::Result<StackProfile> {
+) -> anyhow::Result<JemallocHeapProfile> {
 	let mut current_stack = None;
 	let mut profile = StackProfile {
 		annotations: Default::default(),
@@ -318,11 +325,12 @@ pub(crate) fn parse_jemalloc_heap_profile<R: BufRead>(
 		Some(line) => line?,
 		None => bail!("jemalloc heap dump was empty"),
 	};
-	let sampling_rate: f64 = first_line
+	let sampling_rate: u64 = first_line
 		.trim()
 		.strip_prefix("heap_v2/")
 		.ok_or_else(|| anyhow::anyhow!("unsupported jemalloc heap profile header: {first_line}"))?
 		.parse()?;
+	let sampling_rate_f64 = sampling_rate as f64;
 
 	for line in lines {
 		let line = line?;
@@ -364,9 +372,9 @@ pub(crate) fn parse_jemalloc_heap_profile<R: BufRead>(
 				.parse()?;
 
 			let (inuse_objects, inuse_space) =
-				scale_jemalloc_heap_sample(current_objects, current_bytes, sampling_rate);
+				scale_jemalloc_heap_sample(current_objects, current_bytes, sampling_rate_f64);
 			let (alloc_objects, alloc_space) =
-				scale_jemalloc_heap_sample(accumulated_objects, accumulated_bytes, sampling_rate);
+				scale_jemalloc_heap_sample(accumulated_objects, accumulated_bytes, sampling_rate_f64);
 			if inuse_objects == 0 && inuse_space == 0 && alloc_objects == 0 && alloc_space == 0 {
 				continue;
 			}
@@ -385,7 +393,10 @@ pub(crate) fn parse_jemalloc_heap_profile<R: BufRead>(
 		bail!("jemalloc heap dump contains a stack without counters");
 	}
 
-	Ok(profile)
+	Ok(JemallocHeapProfile {
+		profile,
+		sampling_rate: sampling_rate.min(i64::MAX as u64) as i64,
+	})
 }
 
 fn is_pprof_alloc_internal_frame(addr: u64) -> bool {
@@ -537,10 +548,11 @@ mod tests {
 	#[cfg(feature = "allocator-jemalloc")]
 	fn jemalloc_heap_profile_parser_reads_current_and_accumulated_counters() {
 		let input = b"heap_v2/512\n@ 0x20 0x10\n  t*: 1: 1024 [3: 2048]\n";
-		let profile = parse_jemalloc_heap_profile(&input[..], Vec::new()).unwrap();
+		let parsed = parse_jemalloc_heap_profile(&input[..], Vec::new()).unwrap();
 
-		assert_eq!(profile.stacks.len(), 1);
-		let stack = &profile.stacks[0].0;
+		assert_eq!(parsed.sampling_rate, 512);
+		assert_eq!(parsed.profile.stacks.len(), 1);
+		let stack = &parsed.profile.stacks[0].0;
 		assert_eq!(stack.addrs, vec![0x1f, 0xf]);
 		assert_eq!(stack.values.len(), 4);
 		assert!((4..=5).contains(&stack.values[0]));

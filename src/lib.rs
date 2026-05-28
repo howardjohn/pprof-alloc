@@ -376,34 +376,32 @@ impl PprofAlloc {
 	}
 
 	fn record_allocation_stats(&self, size: usize) {
-		if self.wrapper_allocation_stats_enabled() {
-			if LOCAL_STATS
-				.try_with(|stats| stats.record_allocation(size as u64))
-				.is_err()
-			{
-				GLOBAL_STATS
-					.allocated
-					.fetch_add(size as u64, Ordering::Relaxed);
-				GLOBAL_STATS.allocations.fetch_add(1, Ordering::Relaxed);
-			}
+		if LOCAL_STATS
+			.try_with(|stats| stats.record_allocation(size as u64))
+			.is_err()
+		{
+			GLOBAL_STATS
+				.allocated
+				.fetch_add(size as u64, Ordering::Relaxed);
+			GLOBAL_STATS.allocations.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
 	fn record_deallocation_stats(&self, size: usize) {
-		if self.wrapper_allocation_stats_enabled() {
-			if LOCAL_STATS
-				.try_with(|stats| stats.record_deallocation(size as u64))
-				.is_err()
-			{
-				GLOBAL_STATS.freed.fetch_add(size as u64, Ordering::Relaxed);
-				GLOBAL_STATS.frees.fetch_add(1, Ordering::Relaxed);
-			}
+		if LOCAL_STATS
+			.try_with(|stats| stats.record_deallocation(size as u64))
+			.is_err()
+		{
+			GLOBAL_STATS.freed.fetch_add(size as u64, Ordering::Relaxed);
+			GLOBAL_STATS.frees.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
 	#[cfg(test)]
 	fn record_allocation(&self, ptr: usize, size: usize) {
-		self.record_allocation_stats(size);
+		if self.stats {
+			self.record_allocation_stats(size);
+		}
 		if let Some(sample_rate) = self.active_pprof_sample_rate() {
 			self.record_profile_allocation(ptr, size, sample_rate);
 		}
@@ -418,20 +416,27 @@ impl PprofAlloc {
 		}
 	}
 
-	fn record_tracked_allocation(&self, ptr: *mut u8, size: usize, sample_rate: Option<usize>) {
+	fn record_tracked_allocation(
+		&self,
+		ptr: *mut u8,
+		size: usize,
+		sample_rate: Option<usize>,
+		track_stats: bool,
+	) {
 		if ptr.is_null() {
 			return;
 		}
 
-		self.record_allocation_stats(size);
+		if track_stats {
+			self.record_allocation_stats(size);
+		}
 		if let Some(sample_rate) = sample_rate {
 			self.record_profile_allocation(ptr as usize, size, sample_rate);
 		}
 	}
 
-	fn tracking_is_recursive(&self, sample_rate: Option<usize>) -> bool {
-		(sample_rate.is_some() || self.wrapper_allocation_stats_enabled())
-			&& IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
+	fn tracking_is_recursive(&self, sample_rate: Option<usize>, track_stats: bool) -> bool {
+		(sample_rate.is_some() || track_stats) && IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
 	}
 
 	fn tracking_mode(&self) -> TrackingMode {
@@ -464,12 +469,6 @@ impl PprofAlloc {
 		};
 		self.tracking_mode.store(mode as u8, Ordering::Relaxed);
 		mode
-	}
-
-	fn wrapper_allocation_stats_enabled(&self) -> bool {
-		self.stats
-			&& !(cfg!(feature = "allocator-jemalloc")
-				&& env::selected_allocator(self.default_allocator) == AllocatorSelection::Jemalloc)
 	}
 
 	#[cfg(all(test, feature = "allocator-jemalloc"))]
@@ -508,9 +507,11 @@ impl PprofAlloc {
 		POINTER_MAP.insert(ptr, record);
 	}
 
-	fn finish_deallocation(&self, record: Option<AllocationRecord>, size: usize) {
+	fn finish_deallocation(&self, record: Option<AllocationRecord>, size: usize, track_stats: bool) {
 		let freed_size = record.as_ref().map(|record| record.size).unwrap_or(size);
-		self.record_deallocation_stats(freed_size);
+		if track_stats {
+			self.record_deallocation_stats(freed_size);
+		}
 
 		let Some(record) = record else {
 			return;
@@ -524,13 +525,13 @@ impl PprofAlloc {
 	#[cfg(test)]
 	fn record_deallocation(&self, ptr: usize, size: usize) {
 		let record = self.take_allocation_record(ptr);
-		self.finish_deallocation(record, size);
+		self.finish_deallocation(record, size, self.stats);
 	}
 
 	#[cfg(test)]
 	fn record_reallocation(&self, old_ptr: usize, old_size: usize, new_ptr: usize, new_size: usize) {
 		let record = self.take_allocation_record(old_ptr);
-		self.finish_deallocation(record, old_size);
+		self.finish_deallocation(record, old_size, self.stats);
 		self.record_allocation(new_ptr, new_size);
 	}
 
@@ -611,7 +612,9 @@ lazy_static::lazy_static! {
 /// report jemalloc's native current allocated bytes as `allocated`
 /// and leave cumulative free/object counters unset.
 pub fn allocation_stats() -> stats::Allocations {
-	if native_allocation_stats_selected() {
+	if cfg!(feature = "allocator-jemalloc")
+		&& env::cached_allocator() == Some(AllocatorSelection::Jemalloc)
+	{
 		if let Some(stats) = native_allocation_stats() {
 			return stats;
 		}
@@ -619,11 +622,6 @@ pub fn allocation_stats() -> stats::Allocations {
 
 	let _ = LOCAL_STATS.try_with(|stats| stats.flush());
 	GLOBAL_STATS.snapshot()
-}
-
-fn native_allocation_stats_selected() -> bool {
-	cfg!(feature = "allocator-jemalloc")
-		&& env::cached_allocator() == Some(AllocatorSelection::Jemalloc)
 }
 
 #[cfg(feature = "allocator-jemalloc")]
@@ -806,12 +804,16 @@ unsafe impl GlobalAlloc for PprofAlloc {
 				TrackingMode::Pprof | TrackingMode::PprofStats
 			)
 			.then(|| self.effective_pprof_sample_rate());
-			if self.tracking_is_recursive(sample_rate) {
+			let track_stats = matches!(
+				tracking_mode,
+				TrackingMode::Stats | TrackingMode::PprofStats
+			);
+			if self.tracking_is_recursive(sample_rate, track_stats) {
 				return self.inner_alloc(layout);
 			}
 
 			let ptr = self.inner_alloc(layout);
-			self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+			self.record_tracked_allocation(ptr, layout.size(), sample_rate, track_stats);
 			ptr
 		}
 	}
@@ -833,12 +835,16 @@ unsafe impl GlobalAlloc for PprofAlloc {
 				TrackingMode::Pprof | TrackingMode::PprofStats
 			)
 			.then(|| self.effective_pprof_sample_rate());
-			if self.tracking_is_recursive(sample_rate) {
+			let track_stats = matches!(
+				tracking_mode,
+				TrackingMode::Stats | TrackingMode::PprofStats
+			);
+			if self.tracking_is_recursive(sample_rate, track_stats) {
 				return self.inner_alloc_zeroed(layout);
 			}
 
 			let ptr = self.inner_alloc_zeroed(layout);
-			self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+			self.record_tracked_allocation(ptr, layout.size(), sample_rate, track_stats);
 			ptr
 		}
 	}
@@ -860,21 +866,27 @@ unsafe impl GlobalAlloc for PprofAlloc {
 				TrackingMode::Pprof | TrackingMode::PprofStats
 			)
 			.then(|| self.effective_pprof_sample_rate());
-			if self.tracking_is_recursive(sample_rate) {
+			let track_stats = matches!(
+				tracking_mode,
+				TrackingMode::Stats | TrackingMode::PprofStats
+			);
+			if self.tracking_is_recursive(sample_rate, track_stats) {
 				self.inner_dealloc(ptr, layout);
 				return;
 			}
 
 			if sample_rate.is_none() {
 				self.inner_dealloc(ptr, layout);
-				self.record_deallocation_stats(layout.size());
+				if track_stats {
+					self.record_deallocation_stats(layout.size());
+				}
 				return;
 			}
 
 			enter_alloc(|| {
 				let record = self.take_allocation_record(ptr as usize);
 				self.inner_dealloc(ptr, layout);
-				self.finish_deallocation(record, layout.size());
+				self.finish_deallocation(record, layout.size(), track_stats);
 			});
 		}
 	}
@@ -896,13 +908,17 @@ unsafe impl GlobalAlloc for PprofAlloc {
 				TrackingMode::Pprof | TrackingMode::PprofStats
 			)
 			.then(|| self.effective_pprof_sample_rate());
-			if self.tracking_is_recursive(sample_rate) {
+			let track_stats = matches!(
+				tracking_mode,
+				TrackingMode::Stats | TrackingMode::PprofStats
+			);
+			if self.tracking_is_recursive(sample_rate, track_stats) {
 				return self.inner_realloc(ptr, layout, new_size);
 			}
 
 			if sample_rate.is_none() {
 				let new_ptr = self.inner_realloc(ptr, layout, new_size);
-				if !new_ptr.is_null() {
+				if !new_ptr.is_null() && track_stats {
 					self.record_deallocation_stats(layout.size());
 					self.record_allocation_stats(new_size);
 				}
@@ -913,8 +929,8 @@ unsafe impl GlobalAlloc for PprofAlloc {
 				let record = self.take_allocation_record(ptr as usize);
 				let new_ptr = self.inner_realloc(ptr, layout, new_size);
 				if !new_ptr.is_null() {
-					self.finish_deallocation(record, layout.size());
-					self.record_tracked_allocation(new_ptr, new_size, sample_rate);
+					self.finish_deallocation(record, layout.size(), track_stats);
+					self.record_tracked_allocation(new_ptr, new_size, sample_rate, track_stats);
 				} else if let Some(record) = record {
 					self.restore_allocation_record(ptr as usize, record);
 				}
@@ -1091,9 +1107,9 @@ pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
 		.as_deref()
 		.map(|mappings| mappings.to_vec())
 		.unwrap_or_default();
-	let profile =
+	let parsed =
 		crate::pprof::parse_jemalloc_heap_profile(BufReader::new(dump.as_slice()), mappings)?;
-	Ok(profile.to_pprof_with_period(
+	Ok(parsed.profile.to_pprof_with_period(
 		&[
 			("alloc_objects", "count"),
 			("alloc_space", "bytes"),
@@ -1101,7 +1117,7 @@ pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
 			("inuse_space", "bytes"),
 		],
 		("space", "bytes"),
-		0,
+		parsed.sampling_rate,
 		None,
 	))
 }
@@ -1238,6 +1254,18 @@ mod tests {
 		assert!(!PprofAlloc::new().native_pprof_selected());
 
 		unsafe {
+			std::env::set_var(PPROF_BACKEND_ENV, "pprof-alloc");
+		}
+		env::reset_pprof_backend_for_tests();
+		assert!(!PprofAlloc::new().native_pprof_selected());
+
+		unsafe {
+			std::env::set_var(PPROF_BACKEND_ENV, "rust");
+		}
+		env::reset_pprof_backend_for_tests();
+		assert!(!PprofAlloc::new().native_pprof_selected());
+
+		unsafe {
 			std::env::remove_var(PPROF_BACKEND_ENV);
 		}
 		env::reset_allocator_for_tests();
@@ -1247,6 +1275,24 @@ mod tests {
 		unsafe {
 			std::env::remove_var(ALLOCATOR_ENV);
 		}
+		reset_tracking_state();
+	}
+
+	#[test]
+	fn allocator_compat_env_is_used_as_fallback() {
+		let _guard = TEST_GUARD.lock();
+		reset_tracking_state();
+
+		unsafe {
+			std::env::remove_var(ALLOCATOR_ENV);
+			std::env::set_var("ALLOCATOR", "system");
+		}
+
+		assert_eq!(
+			env::selected_allocator(Allocator::Jemalloc),
+			AllocatorSelection::System
+		);
+
 		reset_tracking_state();
 	}
 

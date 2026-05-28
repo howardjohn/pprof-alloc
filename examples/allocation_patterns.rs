@@ -91,7 +91,7 @@ async fn main_inner() {
 
 	std::fs::File::create("/tmp/pprof")
 		.unwrap()
-		.write(&pprof_alloc::generate_pprof().unwrap())
+		.write_all(&pprof_alloc::generate_pprof().unwrap())
 		.unwrap();
 	println!("wrote pprof to /tmp/pprof");
 
