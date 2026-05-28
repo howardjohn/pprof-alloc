@@ -10,6 +10,11 @@ The long-term goal is to make allocator behavior observable across three layers:
 
 Today, the repository is a working prototype with useful building blocks, but it is not yet a complete allocator observability system.
 
+The wrapper pprof allocator is best treated as a debug-mode opt-in. It records
+sampled allocation ownership in user space and can noticeably degrade allocation
+and deallocation throughput. For low-overhead production heap profiles, prefer
+the jemalloc allocator with jemalloc's native profiler enabled.
+
 ## Current status
 
 What exists today:
@@ -70,20 +75,43 @@ The current crate has three main pieces:
 
 ## Quick start
 
-Use the allocator wrapper as your global allocator:
+For low-overhead production heap profiles, build with `allocator-jemalloc` and
+use the environment-selected allocator:
 
 ```rust
 #[global_allocator]
 static GLOBAL: pprof_alloc::PprofAlloc =
-    pprof_alloc::PprofAlloc::new().with_pprof().with_stats();
-
-pprof_alloc::declare_allocator_kind!(pprof_alloc::allocator::AllocatorKind::Glibc);
+    pprof_alloc::PprofAlloc::new()
+        .with_default(pprof_alloc::Allocator::Jemalloc)
+        .with_pprof()
+        .with_stats();
 ```
 
-`with_pprof()` samples allocations the same way Go's heap profiler does by default:
-one sampled allocation per `512 KiB` of allocated bytes on average. Use
-`with_pprof_sample_rate(1)` to record every allocation, or `with_pprof_sample_rate(0)`
-to disable pprof recording while still allowing other allocator stats.
+Run with `PPROF_ALLOC_ALLOCATOR=jemalloc`. Leave `PPROF_ALLOC_BACKEND` unset to
+use jemalloc's native heap profiler, or set `PPROF_ALLOC_BACKEND=wrapper` to use
+the Rust wrapper sampler for debugging.
+
+With `allocator-jemalloc`, the application owns jemalloc initialization config.
+Set `malloc_conf` or `MALLOC_CONF` before allocator initialization with options
+such as `prof:true,prof_accum:true`. Then call `pprof_alloc::configure()`
+during startup to apply `PPROF_ALLOC_BACKEND` to jemalloc's runtime
+`prof.active` setting and `PPROF_ALLOC_SAMPLE_RATE` to jemalloc's runtime
+sample rate when jemalloc is active. The allocator hot path does not perform
+mallctl configuration.
+
+If you use a non-system builder default and call startup configuration before
+the first allocation, pass the same default explicitly:
+
+```rust
+pprof_alloc::configure_with_default(pprof_alloc::Allocator::Jemalloc)?;
+```
+
+The wrapper sampler records allocations the same way Go's heap profiler does by
+default: one sampled allocation per `512 KiB` of allocated bytes on average. It
+still has per-allocation and sampled-deallocation overhead, so use
+`with_pprof_sample_rate(1)` only for short debug runs. Use
+`with_pprof_sample_rate(0)` to disable wrapper pprof recording while still
+allowing other allocator stats.
 
 The sample rate can also be deferred to an environment variable while keeping the
 global allocator initializer const:
@@ -96,21 +124,27 @@ static GLOBAL: pprof_alloc::PprofAlloc =
         .with_stats();
 ```
 
-Set `PPROF_ALLOC_SAMPLE_RATE` before process startup. The value is read lazily on
-the first profiled allocation; missing or invalid values fall back to the default
-passed to `with_pprof_sample_rate_from_env`.
+Set `PPROF_ALLOC_SAMPLE_RATE` before process startup. For the wrapper sampler,
+the value is read lazily on the first profiled allocation; missing or invalid
+values fall back to the default passed to `with_pprof_sample_rate_from_env`. For
+native jemalloc profiling, `configure()` reads the same env var during startup,
+rounds it up to jemalloc's nearest power-of-two sample period, and applies it
+with `prof.reset`. A value of `0` leaves native profiling inactive.
 
-Or wrap a different allocator directly:
+Set `PPROF_ALLOC_ALLOCATOR=system`, `PPROF_ALLOC_ALLOCATOR=jemalloc`, or
+`PPROF_ALLOC_ALLOCATOR=mimalloc` before startup. `ALLOCATOR` is also accepted as
+a fallback name. The selection is read once on first allocator use, so it cannot
+be changed safely after the process has started. `jemalloc` requires the
+`allocator-jemalloc` feature and `mimalloc` requires `allocator-mimalloc`; if an
+uncompiled allocator is requested, the process exits with an allocator
+configuration error. Enable both allocator features if the same binary should be
+able to choose either allocator at runtime.
 
-```rust
-#[global_allocator]
-static GLOBAL: pprof_alloc::PprofAlloc<mimalloc::MiMalloc> =
-    pprof_alloc::PprofAlloc::from_allocator(mimalloc::MiMalloc)
-        .with_pprof()
-        .with_stats();
-
-pprof_alloc::declare_allocator_kind!(pprof_alloc::allocator::AllocatorKind::Mimalloc);
-```
+When built with `allocator-jemalloc`, `PPROF_ALLOC_BACKEND` selects
+the pprof backend at runtime when the active allocator is jemalloc. Leave it
+unset, or set any value other than `wrapper`, `pprof-alloc`, or `rust`, to use
+jemalloc's native heap profiler. Set `PPROF_ALLOC_BACKEND=wrapper` before
+startup to use `pprof-alloc`'s wrapper sampler instead.
 
 Generate a profile:
 

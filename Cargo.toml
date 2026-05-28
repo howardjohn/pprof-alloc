@@ -21,8 +21,8 @@ include = [
 [features]
 default = ["frame-pointer"]
 frame-pointer = []
-allocator-jemalloc = ["dep:tikv-jemalloc-ctl"]
-allocator-mimalloc = ["dep:libmimalloc-sys"]
+allocator-jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator", "tikv-jemallocator/profiling"]
+allocator-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -46,6 +46,8 @@ thiserror = "1.0"
 quick-xml = { version = "0.38", features = ["serialize"] }
 prometheus-client = "0.24"
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats", "use_std"] }
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", optional = true }
 libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
 
 [dev-dependencies]

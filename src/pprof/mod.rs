@@ -5,10 +5,14 @@ mod proto;
 
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(feature = "allocator-jemalloc")]
+use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "allocator-jemalloc")]
+use anyhow::bail;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use prost::Message;
@@ -280,6 +284,110 @@ impl StackProfile {
 	}
 }
 
+#[cfg(feature = "allocator-jemalloc")]
+fn scale_jemalloc_heap_sample(objects: f64, bytes: f64, sampling_rate: f64) -> (i64, i64) {
+	if objects == 0.0 || bytes == 0.0 {
+		return (0, 0);
+	}
+
+	let ratio = (bytes / objects) / sampling_rate;
+	let scale_factor = 1.0 / (1.0 - (-ratio).exp());
+	let scaled_objects = (objects * scale_factor).trunc();
+	let scaled_bytes = (bytes * scale_factor).trunc();
+	(
+		scaled_objects.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+		scaled_bytes.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+	)
+}
+
+/// Parse jemalloc's textual `heap_v2` profile format into this crate's pprof model.
+#[cfg(feature = "allocator-jemalloc")]
+pub(crate) fn parse_jemalloc_heap_profile<R: BufRead>(
+	r: R,
+	mappings: Vec<Mapping>,
+) -> anyhow::Result<StackProfile> {
+	let mut current_stack = None;
+	let mut profile = StackProfile {
+		annotations: Default::default(),
+		stacks: Default::default(),
+		mappings,
+	};
+	let mut lines = r.lines();
+
+	let first_line = match lines.next() {
+		Some(line) => line?,
+		None => bail!("jemalloc heap dump was empty"),
+	};
+	let sampling_rate: f64 = first_line
+		.trim()
+		.strip_prefix("heap_v2/")
+		.ok_or_else(|| anyhow::anyhow!("unsupported jemalloc heap profile header: {first_line}"))?
+		.parse()?;
+
+	for line in lines {
+		let line = line?;
+		let words: Vec<_> = line.split_ascii_whitespace().collect();
+		if words.is_empty() {
+			continue;
+		}
+
+		if words[0] == "@" {
+			if current_stack.is_some() {
+				bail!("jemalloc heap dump contains a stack without counters");
+			}
+			let addrs = words[1..]
+				.iter()
+				.map(|word| {
+					let raw = word.trim_start_matches("0x");
+					let addr = u64::from_str_radix(raw, 16)?;
+					Ok(addr.saturating_sub(1))
+				})
+				.collect::<Result<Vec<_>, std::num::ParseIntError>>()?;
+			current_stack = Some(addrs);
+		} else if words.len() > 2 && words[0] == "t*:" {
+			let Some(addrs) = current_stack.take() else {
+				continue;
+			};
+
+			let current_objects: f64 = words[1].trim_end_matches(':').parse()?;
+			let current_bytes: f64 = words[2].parse()?;
+			let accumulated_objects: f64 = words
+				.get(3)
+				.and_then(|word| word.strip_prefix('['))
+				.unwrap_or("0")
+				.trim_end_matches(':')
+				.parse()?;
+			let accumulated_bytes: f64 = words
+				.get(4)
+				.map(|word| word.trim_end_matches(']'))
+				.unwrap_or("0")
+				.parse()?;
+
+			let (inuse_objects, inuse_space) =
+				scale_jemalloc_heap_sample(current_objects, current_bytes, sampling_rate);
+			let (alloc_objects, alloc_space) =
+				scale_jemalloc_heap_sample(accumulated_objects, accumulated_bytes, sampling_rate);
+			if inuse_objects == 0 && inuse_space == 0 && alloc_objects == 0 && alloc_space == 0 {
+				continue;
+			}
+
+			profile.push_stack(
+				WeightedStack {
+					addrs,
+					values: smallvec::smallvec![alloc_objects, alloc_space, inuse_objects, inuse_space],
+				},
+				None,
+			);
+		}
+	}
+
+	if current_stack.is_some() {
+		bail!("jemalloc heap dump contains a stack without counters");
+	}
+
+	Ok(profile)
+}
+
 fn is_pprof_alloc_internal_frame(addr: u64) -> bool {
 	let mut internal = false;
 	backtrace::resolve(addr as *mut std::ffi::c_void, |symbol| {
@@ -423,5 +531,21 @@ mod tests {
 		assert!(!is_pprof_alloc_internal_function(
 			"example::allocation_hot_path"
 		));
+	}
+
+	#[test]
+	#[cfg(feature = "allocator-jemalloc")]
+	fn jemalloc_heap_profile_parser_reads_current_and_accumulated_counters() {
+		let input = b"heap_v2/512\n@ 0x20 0x10\n  t*: 1: 1024 [3: 2048]\n";
+		let profile = parse_jemalloc_heap_profile(&input[..], Vec::new()).unwrap();
+
+		assert_eq!(profile.stacks.len(), 1);
+		let stack = &profile.stacks[0].0;
+		assert_eq!(stack.addrs, vec![0x1f, 0xf]);
+		assert_eq!(stack.values.len(), 4);
+		assert!((4..=5).contains(&stack.values[0]));
+		assert!((2770..=2790).contains(&stack.values[1]));
+		assert_eq!(stack.values[2], 1);
+		assert!((1180..=1190).contains(&stack.values[3]));
 	}
 }

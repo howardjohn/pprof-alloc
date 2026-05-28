@@ -12,10 +12,13 @@
 //! [`GlobalAlloc`]: std::alloc::GlobalAlloc
 
 pub mod allocator;
+mod env;
 mod pprof;
 pub mod stats;
 mod trace;
 
+pub use crate::env::{ALLOCATOR_ENV, Allocator, PPROF_BACKEND_ENV, PPROF_SAMPLE_RATE_ENV};
+use crate::env::{AllocatorSelection, PprofBackend};
 use crate::pprof::{StackProfile, WeightedStack};
 use crate::trace::HashedBacktrace;
 use dashmap::DashMap;
@@ -34,29 +37,43 @@ pub use crate::trace::CaptureMode;
 /// allocation, while `0` disables pprof stack recording.
 pub const DEFAULT_PPROF_SAMPLE_RATE: usize = 512 * 1024;
 
-/// Environment variable read by [`PprofAlloc::with_pprof_sample_rate_from_env`].
-///
-/// The value must be an unsigned integer byte rate. Missing or invalid values
-/// use the default passed to `with_pprof_sample_rate_from_env`.
-pub const PPROF_SAMPLE_RATE_ENV: &str = "PPROF_ALLOC_SAMPLE_RATE";
-
-const PPROF_SAMPLE_RATE_ENV_CSTR: &[u8] = b"PPROF_ALLOC_SAMPLE_RATE\0";
 const MAX_FAST_EXP_RAND_MEAN: usize = 0x7000000;
 const RANDOM_BIT_COUNT: u32 = 26;
-const ENV_SAMPLE_RATE_UNINITIALIZED: u8 = 0;
-const ENV_SAMPLE_RATE_SET: u8 = 1;
-const ENV_SAMPLE_RATE_UNSET: u8 = 2;
 const RESOLVED_SAMPLE_RATE_UNINITIALIZED: usize = usize::MAX;
 const STATS_FLUSH_EVENTS: u64 = 1024;
 const STATS_FLUSH_BYTES: u64 = 1024 * 1024;
 
-/// Global allocator wrapper that can collect allocation counters and pprof heap profiles.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackingMode {
+	Uninitialized = 0,
+	System = 1,
+	Jemalloc = 2,
+	Mimalloc = 3,
+	Stats = 4,
+	Pprof = 5,
+	PprofStats = 6,
+}
+
+impl TrackingMode {
+	const fn from_u8(value: u8) -> Self {
+		match value {
+			1 => Self::System,
+			2 => Self::Jemalloc,
+			3 => Self::Mimalloc,
+			4 => Self::Stats,
+			5 => Self::Pprof,
+			6 => Self::PprofStats,
+			_ => Self::Uninitialized,
+		}
+	}
+}
+
+/// Global allocator that can collect allocation counters and pprof heap profiles.
 ///
-/// Use this as a `#[global_allocator]` around [`std::alloc::System`] or another
-/// allocator implementing [`GlobalAlloc`]. Profiling and coarse allocation
-/// counters are opt-in through the builder methods.
-pub struct PprofAlloc<A = System> {
-	inner: A,
+/// Use this as the process `#[global_allocator]`. The backing allocator is
+/// selected from [`ALLOCATOR_ENV`] on first allocation.
+pub struct PprofAlloc {
 	/// Enable profiling support
 	pprof: bool,
 	/// Enable coarse grained stats
@@ -67,6 +84,10 @@ pub struct PprofAlloc<A = System> {
 	pprof_sample_rate_from_env: bool,
 	/// Cached resolved sample rate for env-driven configuration.
 	resolved_pprof_sample_rate: AtomicUsize,
+	/// Cached wrapper work needed on allocation/deallocation.
+	tracking_mode: AtomicU8,
+	/// Allocator to use when [`ALLOCATOR_ENV`] is unset.
+	default_allocator: Allocator,
 }
 
 #[derive(Clone)]
@@ -247,36 +268,40 @@ pub struct MemorySnapshot {
 	pub smaps: Option<stats::smaps::ProcessStats>,
 }
 
-impl Default for PprofAlloc<System> {
+impl Default for PprofAlloc {
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-impl PprofAlloc<System> {
-	/// Create a wrapper around [`std::alloc::System`] with profiling disabled.
+impl PprofAlloc {
+	/// Create an allocator with profiling disabled.
 	///
 	/// Use [`Self::with_pprof`], [`Self::with_pprof_sample_rate`], or
 	/// [`Self::with_stats`] to enable collection.
 	pub const fn new() -> Self {
-		Self::from_allocator(System)
-	}
-}
-
-impl<A> PprofAlloc<A> {
-	/// Create a wrapper around a custom allocator with profiling disabled.
-	pub const fn from_allocator(inner: A) -> Self {
 		PprofAlloc {
-			inner,
 			pprof: false,
 			stats: false,
 			pprof_sample_rate: DEFAULT_PPROF_SAMPLE_RATE,
 			pprof_sample_rate_from_env: false,
 			resolved_pprof_sample_rate: AtomicUsize::new(RESOLVED_SAMPLE_RATE_UNINITIALIZED),
+			tracking_mode: AtomicU8::new(TrackingMode::Uninitialized as u8),
+			default_allocator: Allocator::System,
 		}
 	}
 
+	/// Set the allocator used when [`ALLOCATOR_ENV`] is unset.
+	pub const fn with_default(mut self, allocator: Allocator) -> Self {
+		self.default_allocator = allocator;
+		self
+	}
+
 	/// Enable sampled pprof stack profiling using [`DEFAULT_PPROF_SAMPLE_RATE`].
+	///
+	/// When the active allocator is jemalloc and the backend env selects native
+	/// profiling, builds with `allocator-jemalloc` use jemalloc's native heap
+	/// profiler instead of wrapper-side allocation tracking.
 	pub const fn with_pprof(mut self) -> Self {
 		self.pprof = true;
 		self
@@ -286,6 +311,9 @@ impl<A> PprofAlloc<A> {
 	///
 	/// A rate of `1` records every allocation. A rate of `0` disables pprof
 	/// stack recording while still allowing other enabled collectors to run.
+	/// When native jemalloc profiling is selected, this wrapper-side rate is
+	/// ignored. Use [`PPROF_SAMPLE_RATE_ENV`] with [`configure`] to set jemalloc's
+	/// runtime sample rate.
 	pub const fn with_pprof_sample_rate(mut self, bytes: usize) -> Self {
 		self.pprof = true;
 		self.pprof_sample_rate = bytes;
@@ -297,6 +325,8 @@ impl<A> PprofAlloc<A> {
 	///
 	/// [`PPROF_SAMPLE_RATE_ENV`] is read lazily on the first profiled allocation.
 	/// If the variable is missing or invalid, `default_rate` is used.
+	/// When native jemalloc profiling is selected, [`configure`] applies this
+	/// environment variable to jemalloc's runtime sample rate.
 	pub const fn with_pprof_sample_rate_from_env(mut self, default_rate: usize) -> Self {
 		self.pprof = true;
 		self.pprof_sample_rate = default_rate;
@@ -305,6 +335,10 @@ impl<A> PprofAlloc<A> {
 	}
 
 	/// Enable coarse process-wide allocation and free counters.
+	///
+	/// When the active allocator is jemalloc and jemalloc support is compiled
+	/// in, snapshots use jemalloc's native process stats instead of these
+	/// wrapper-side counters.
 	pub const fn with_stats(mut self) -> Self {
 		self.stats = true;
 		self
@@ -327,8 +361,12 @@ impl<A> PprofAlloc<A> {
 		}
 	}
 
+	#[cfg(test)]
 	fn active_pprof_sample_rate(&self) -> Option<usize> {
-		if !self.pprof {
+		if !matches!(
+			self.tracking_mode(),
+			TrackingMode::Pprof | TrackingMode::PprofStats
+		) {
 			return None;
 		}
 
@@ -338,7 +376,7 @@ impl<A> PprofAlloc<A> {
 	}
 
 	fn record_allocation_stats(&self, size: usize) {
-		if self.stats {
+		if self.wrapper_allocation_stats_enabled() {
 			if LOCAL_STATS
 				.try_with(|stats| stats.record_allocation(size as u64))
 				.is_err()
@@ -352,7 +390,7 @@ impl<A> PprofAlloc<A> {
 	}
 
 	fn record_deallocation_stats(&self, size: usize) {
-		if self.stats {
+		if self.wrapper_allocation_stats_enabled() {
 			if LOCAL_STATS
 				.try_with(|stats| stats.record_deallocation(size as u64))
 				.is_err()
@@ -373,8 +411,10 @@ impl<A> PprofAlloc<A> {
 
 	fn record_profile_allocation(&self, ptr: usize, size: usize, sample_rate: usize) {
 		if should_sample_allocation(size, sample_rate) {
-			let trace = HashedBacktrace::capture();
-			self.record_allocation_with_trace(ptr, size, trace);
+			enter_alloc(|| {
+				let trace = HashedBacktrace::capture();
+				self.record_allocation_with_trace(ptr, size, trace);
+			});
 		}
 	}
 
@@ -390,7 +430,57 @@ impl<A> PprofAlloc<A> {
 	}
 
 	fn tracking_is_recursive(&self, sample_rate: Option<usize>) -> bool {
-		(sample_rate.is_some() || self.stats) && IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
+		(sample_rate.is_some() || self.wrapper_allocation_stats_enabled())
+			&& IN_ALLOC.try_with(|x| x.get()).unwrap_or(true)
+	}
+
+	fn tracking_mode(&self) -> TrackingMode {
+		let mode = TrackingMode::from_u8(self.tracking_mode.load(Ordering::Relaxed));
+		if mode != TrackingMode::Uninitialized {
+			return mode;
+		}
+
+		let selected_allocator = env::selected_allocator(self.default_allocator);
+		let native_jemalloc =
+			cfg!(feature = "allocator-jemalloc") && selected_allocator == AllocatorSelection::Jemalloc;
+		let native_pprof = native_jemalloc && env::selected_pprof_backend() == PprofBackend::Native;
+		let wrapper_stats = self.stats && !native_jemalloc;
+		let wrapper_pprof_rate = (self.pprof && !native_pprof).then(|| {
+			let sample_rate = self.effective_pprof_sample_rate();
+			CURRENT_PPROF_SAMPLE_RATE.store(sample_rate, Ordering::Relaxed);
+			sample_rate
+		});
+		let wrapper_pprof = wrapper_pprof_rate.is_some_and(|sample_rate| sample_rate != 0);
+
+		let mode = match (wrapper_pprof, wrapper_stats) {
+			(false, false) => match selected_allocator {
+				AllocatorSelection::Jemalloc => TrackingMode::Jemalloc,
+				AllocatorSelection::Mimalloc => TrackingMode::Mimalloc,
+				_ => TrackingMode::System,
+			},
+			(false, true) => TrackingMode::Stats,
+			(true, false) => TrackingMode::Pprof,
+			(true, true) => TrackingMode::PprofStats,
+		};
+		self.tracking_mode.store(mode as u8, Ordering::Relaxed);
+		mode
+	}
+
+	fn wrapper_allocation_stats_enabled(&self) -> bool {
+		self.stats
+			&& !(cfg!(feature = "allocator-jemalloc")
+				&& env::selected_allocator(self.default_allocator) == AllocatorSelection::Jemalloc)
+	}
+
+	#[cfg(all(test, feature = "allocator-jemalloc"))]
+	fn native_pprof_selected(&self) -> bool {
+		match env::selected_pprof_backend() {
+			PprofBackend::Wrapper => false,
+			PprofBackend::Native => {
+				env::selected_allocator(self.default_allocator) == AllocatorSelection::Jemalloc
+			},
+			PprofBackend::Uninitialized => false,
+		}
 	}
 
 	fn record_allocation_with_trace(&self, ptr: usize, size: usize, trace: HashedBacktrace) {
@@ -443,6 +533,46 @@ impl<A> PprofAlloc<A> {
 		self.finish_deallocation(record, old_size);
 		self.record_allocation(new_ptr, new_size);
 	}
+
+	unsafe fn inner_alloc(&self, layout: Layout) -> *mut u8 {
+		match env::selected_allocator(self.default_allocator) {
+			#[cfg(feature = "allocator-jemalloc")]
+			AllocatorSelection::Jemalloc => unsafe { JEMALLOC_ALLOCATOR.alloc(layout) },
+			#[cfg(feature = "allocator-mimalloc")]
+			AllocatorSelection::Mimalloc => unsafe { MIMALLOC_ALLOCATOR.alloc(layout) },
+			_ => unsafe { System.alloc(layout) },
+		}
+	}
+
+	unsafe fn inner_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+		match env::selected_allocator(self.default_allocator) {
+			#[cfg(feature = "allocator-jemalloc")]
+			AllocatorSelection::Jemalloc => unsafe { JEMALLOC_ALLOCATOR.alloc_zeroed(layout) },
+			#[cfg(feature = "allocator-mimalloc")]
+			AllocatorSelection::Mimalloc => unsafe { MIMALLOC_ALLOCATOR.alloc_zeroed(layout) },
+			_ => unsafe { System.alloc_zeroed(layout) },
+		}
+	}
+
+	unsafe fn inner_dealloc(&self, ptr: *mut u8, layout: Layout) {
+		match env::selected_allocator(self.default_allocator) {
+			#[cfg(feature = "allocator-jemalloc")]
+			AllocatorSelection::Jemalloc => unsafe { JEMALLOC_ALLOCATOR.dealloc(ptr, layout) },
+			#[cfg(feature = "allocator-mimalloc")]
+			AllocatorSelection::Mimalloc => unsafe { MIMALLOC_ALLOCATOR.dealloc(ptr, layout) },
+			_ => unsafe { System.dealloc(ptr, layout) },
+		}
+	}
+
+	unsafe fn inner_realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+		match env::selected_allocator(self.default_allocator) {
+			#[cfg(feature = "allocator-jemalloc")]
+			AllocatorSelection::Jemalloc => unsafe { JEMALLOC_ALLOCATOR.realloc(ptr, layout, new_size) },
+			#[cfg(feature = "allocator-mimalloc")]
+			AllocatorSelection::Mimalloc => unsafe { MIMALLOC_ALLOCATOR.realloc(ptr, layout, new_size) },
+			_ => unsafe { System.realloc(ptr, layout, new_size) },
+		}
+	}
 }
 
 fn enter_alloc<T>(func: impl FnOnce() -> T) -> T {
@@ -468,10 +598,7 @@ thread_local! {
 }
 
 static GLOBAL_STATS: stats::AtomicAllocations = stats::AtomicAllocations::new();
-static ENV_PPROF_SAMPLE_RATE_STATE: AtomicU8 = AtomicU8::new(ENV_SAMPLE_RATE_UNINITIALIZED);
-static ENV_PPROF_SAMPLE_RATE_VALUE: AtomicUsize = AtomicUsize::new(DEFAULT_PPROF_SAMPLE_RATE);
 static CURRENT_PPROF_SAMPLE_RATE: AtomicUsize = AtomicUsize::new(DEFAULT_PPROF_SAMPLE_RATE);
-
 lazy_static::lazy_static! {
 	static ref POINTER_MAP: DashMap<usize, AllocationRecord> = DashMap::new();
 	static ref TRACE_MAP: DashMap<HashedBacktrace, stats::Allocations> = DashMap::new();
@@ -480,10 +607,42 @@ lazy_static::lazy_static! {
 /// Return a snapshot of coarse process-wide allocation counters.
 ///
 /// These counters are updated only when the global allocator wrapper was
-/// configured with [`PprofAlloc::with_stats`].
+/// configured with [`PprofAlloc::with_stats`]. Builds with jemalloc support
+/// report jemalloc's native current allocated bytes as `allocated`
+/// and leave cumulative free/object counters unset.
 pub fn allocation_stats() -> stats::Allocations {
+	if native_allocation_stats_selected() {
+		if let Some(stats) = native_allocation_stats() {
+			return stats;
+		}
+	}
+
 	let _ = LOCAL_STATS.try_with(|stats| stats.flush());
 	GLOBAL_STATS.snapshot()
+}
+
+fn native_allocation_stats_selected() -> bool {
+	cfg!(feature = "allocator-jemalloc")
+		&& env::cached_allocator() == Some(AllocatorSelection::Jemalloc)
+}
+
+#[cfg(feature = "allocator-jemalloc")]
+fn native_allocation_stats() -> Option<stats::Allocations> {
+	use tikv_jemalloc_ctl::{epoch, stats as jemalloc_stats};
+
+	epoch::advance().ok()?;
+	let allocated = jemalloc_stats::allocated::read().ok()? as u64;
+	Some(stats::Allocations {
+		allocated,
+		freed: 0,
+		allocations: 0,
+		frees: 0,
+	})
+}
+
+#[cfg(not(feature = "allocator-jemalloc"))]
+fn native_allocation_stats() -> Option<stats::Allocations> {
+	None
 }
 
 /// Return the stack capture mode compiled into this build.
@@ -500,47 +659,7 @@ fn current_pprof_sample_rate() -> usize {
 }
 
 fn env_pprof_sample_rate(default_rate: usize) -> usize {
-	match ENV_PPROF_SAMPLE_RATE_STATE.load(Ordering::Acquire) {
-		ENV_SAMPLE_RATE_SET => return ENV_PPROF_SAMPLE_RATE_VALUE.load(Ordering::Relaxed),
-		ENV_SAMPLE_RATE_UNSET => return default_rate,
-		_ => {},
-	}
-
-	if let Some(sample_rate) = read_pprof_sample_rate_env() {
-		ENV_PPROF_SAMPLE_RATE_VALUE.store(sample_rate, Ordering::Relaxed);
-		ENV_PPROF_SAMPLE_RATE_STATE.store(ENV_SAMPLE_RATE_SET, Ordering::Release);
-		sample_rate
-	} else {
-		ENV_PPROF_SAMPLE_RATE_STATE.store(ENV_SAMPLE_RATE_UNSET, Ordering::Release);
-		default_rate
-	}
-}
-
-fn read_pprof_sample_rate_env() -> Option<usize> {
-	let ptr = unsafe { libc::getenv(PPROF_SAMPLE_RATE_ENV_CSTR.as_ptr().cast()) };
-	if ptr.is_null() {
-		return None;
-	}
-
-	let mut value = 0usize;
-	let mut cursor = ptr.cast::<u8>();
-	let mut saw_digit = false;
-	loop {
-		let byte = unsafe { *cursor };
-		if byte == 0 {
-			break;
-		}
-		if !byte.is_ascii_digit() {
-			return None;
-		}
-		saw_digit = true;
-		value = value
-			.saturating_mul(10)
-			.saturating_add((byte - b'0') as usize);
-		cursor = unsafe { cursor.add(1) };
-	}
-
-	saw_digit.then_some(value)
+	env::pprof_sample_rate(default_rate)
 }
 
 fn should_sample_allocation(size: usize, sample_rate: usize) -> bool {
@@ -590,13 +709,9 @@ fn fast_exp_rand(mean: usize) -> i32 {
 		return 0;
 	}
 
-	let q = cheap_random_n(1 << RANDOM_BIT_COUNT) + 1;
+	let q = (cheap_random() % u64::from(1u32 << RANDOM_BIT_COUNT)) as u32 + 1;
 	let qlog = ((q as f64).log2() - RANDOM_BIT_COUNT as f64).min(0.0);
 	(qlog * (-std::f64::consts::LN_2 * mean as f64)) as i32 + 1
-}
-
-fn cheap_random_n(n: u32) -> u32 {
-	(cheap_random() % u64::from(n)) as u32
 }
 
 fn cheap_random() -> u64 {
@@ -668,66 +783,97 @@ fn pprof_summary() -> PprofSummary {
 	summary
 }
 
-unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
+#[cfg(feature = "allocator-jemalloc")]
+static JEMALLOC_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(feature = "allocator-mimalloc")]
+static MIMALLOC_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+unsafe impl GlobalAlloc for PprofAlloc {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		unsafe {
-			let sample_rate = self.active_pprof_sample_rate();
+			let tracking_mode = self.tracking_mode();
+			match tracking_mode {
+				TrackingMode::System => return System.alloc(layout),
+				#[cfg(feature = "allocator-jemalloc")]
+				TrackingMode::Jemalloc => return JEMALLOC_ALLOCATOR.alloc(layout),
+				#[cfg(feature = "allocator-mimalloc")]
+				TrackingMode::Mimalloc => return MIMALLOC_ALLOCATOR.alloc(layout),
+				_ => {},
+			}
+
+			let sample_rate = matches!(
+				tracking_mode,
+				TrackingMode::Pprof | TrackingMode::PprofStats
+			)
+			.then(|| self.effective_pprof_sample_rate());
 			if self.tracking_is_recursive(sample_rate) {
-				return self.inner.alloc(layout);
+				return self.inner_alloc(layout);
 			}
 
-			if sample_rate.is_none() {
-				let ptr = self.inner.alloc(layout);
-				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
-				return ptr;
-			}
-
-			enter_alloc(|| {
-				let ptr = self.inner.alloc(layout);
-				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
-				ptr
-			})
+			let ptr = self.inner_alloc(layout);
+			self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+			ptr
 		}
 	}
 
 	unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
 		unsafe {
-			let sample_rate = self.active_pprof_sample_rate();
+			let tracking_mode = self.tracking_mode();
+			match tracking_mode {
+				TrackingMode::System => return System.alloc_zeroed(layout),
+				#[cfg(feature = "allocator-jemalloc")]
+				TrackingMode::Jemalloc => return JEMALLOC_ALLOCATOR.alloc_zeroed(layout),
+				#[cfg(feature = "allocator-mimalloc")]
+				TrackingMode::Mimalloc => return MIMALLOC_ALLOCATOR.alloc_zeroed(layout),
+				_ => {},
+			}
+
+			let sample_rate = matches!(
+				tracking_mode,
+				TrackingMode::Pprof | TrackingMode::PprofStats
+			)
+			.then(|| self.effective_pprof_sample_rate());
 			if self.tracking_is_recursive(sample_rate) {
-				return self.inner.alloc_zeroed(layout);
+				return self.inner_alloc_zeroed(layout);
 			}
 
-			if sample_rate.is_none() {
-				let ptr = self.inner.alloc_zeroed(layout);
-				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
-				return ptr;
-			}
-
-			enter_alloc(|| {
-				let ptr = self.inner.alloc_zeroed(layout);
-				self.record_tracked_allocation(ptr, layout.size(), sample_rate);
-				ptr
-			})
+			let ptr = self.inner_alloc_zeroed(layout);
+			self.record_tracked_allocation(ptr, layout.size(), sample_rate);
+			ptr
 		}
 	}
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 		unsafe {
-			let sample_rate = self.active_pprof_sample_rate();
+			let tracking_mode = self.tracking_mode();
+			match tracking_mode {
+				TrackingMode::System => return System.dealloc(ptr, layout),
+				#[cfg(feature = "allocator-jemalloc")]
+				TrackingMode::Jemalloc => return JEMALLOC_ALLOCATOR.dealloc(ptr, layout),
+				#[cfg(feature = "allocator-mimalloc")]
+				TrackingMode::Mimalloc => return MIMALLOC_ALLOCATOR.dealloc(ptr, layout),
+				_ => {},
+			}
+
+			let sample_rate = matches!(
+				tracking_mode,
+				TrackingMode::Pprof | TrackingMode::PprofStats
+			)
+			.then(|| self.effective_pprof_sample_rate());
 			if self.tracking_is_recursive(sample_rate) {
-				self.inner.dealloc(ptr, layout);
+				self.inner_dealloc(ptr, layout);
 				return;
 			}
 
 			if sample_rate.is_none() {
-				self.inner.dealloc(ptr, layout);
+				self.inner_dealloc(ptr, layout);
 				self.record_deallocation_stats(layout.size());
 				return;
 			}
 
 			enter_alloc(|| {
 				let record = self.take_allocation_record(ptr as usize);
-				self.inner.dealloc(ptr, layout);
+				self.inner_dealloc(ptr, layout);
 				self.finish_deallocation(record, layout.size());
 			});
 		}
@@ -735,13 +881,27 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 
 	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
 		unsafe {
-			let sample_rate = self.active_pprof_sample_rate();
+			let tracking_mode = self.tracking_mode();
+			match tracking_mode {
+				TrackingMode::System => return System.realloc(ptr, layout, new_size),
+				#[cfg(feature = "allocator-jemalloc")]
+				TrackingMode::Jemalloc => return JEMALLOC_ALLOCATOR.realloc(ptr, layout, new_size),
+				#[cfg(feature = "allocator-mimalloc")]
+				TrackingMode::Mimalloc => return MIMALLOC_ALLOCATOR.realloc(ptr, layout, new_size),
+				_ => {},
+			}
+
+			let sample_rate = matches!(
+				tracking_mode,
+				TrackingMode::Pprof | TrackingMode::PprofStats
+			)
+			.then(|| self.effective_pprof_sample_rate());
 			if self.tracking_is_recursive(sample_rate) {
-				return self.inner.realloc(ptr, layout, new_size);
+				return self.inner_realloc(ptr, layout, new_size);
 			}
 
 			if sample_rate.is_none() {
-				let new_ptr = self.inner.realloc(ptr, layout, new_size);
+				let new_ptr = self.inner_realloc(ptr, layout, new_size);
 				if !new_ptr.is_null() {
 					self.record_deallocation_stats(layout.size());
 					self.record_allocation_stats(new_size);
@@ -751,7 +911,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 
 			enter_alloc(|| {
 				let record = self.take_allocation_record(ptr as usize);
-				let new_ptr = self.inner.realloc(ptr, layout, new_size);
+				let new_ptr = self.inner_realloc(ptr, layout, new_size);
 				if !new_ptr.is_null() {
 					self.finish_deallocation(record, layout.size());
 					self.record_tracked_allocation(new_ptr, new_size, sample_rate);
@@ -765,6 +925,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PprofAlloc<A> {
 }
 
 pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
+	if cfg!(feature = "allocator-jemalloc")
+		&& env::cached_allocator() == Some(AllocatorSelection::Jemalloc)
+		&& env::selected_pprof_backend() == PprofBackend::Native
+	{
+		return generate_jemalloc_pprof();
+	}
+
 	enter_alloc(|| {
 		let sample_rate = current_pprof_sample_rate();
 		let mut profile = StackProfile {
@@ -815,6 +982,148 @@ pub fn generate_pprof() -> anyhow::Result<Vec<u8>> {
 	})
 }
 
+/// Apply optional runtime configuration from environment variables.
+///
+/// Call this during application startup. Without `allocator-jemalloc`, this is a
+/// no-op. With `allocator-jemalloc` and jemalloc selected, this applies
+/// [`PPROF_BACKEND_ENV`] to jemalloc's runtime `prof.active` setting and
+/// [`PPROF_SAMPLE_RATE_ENV`] to jemalloc's runtime `prof.lg_sample` setting.
+/// The application is still responsible for enabling jemalloc profiling at
+/// initialization time, for example with a `malloc_conf`/`MALLOC_CONF` that
+/// includes `prof:true` and `prof_accum:true`.
+#[cfg(feature = "allocator-jemalloc")]
+pub fn configure() -> anyhow::Result<()> {
+	configure_with_default(Allocator::System)
+}
+
+/// Apply optional runtime configuration with an explicit fallback allocator.
+///
+/// Use this instead of [`configure`] when `PprofAlloc::with_default` is set to a
+/// non-system allocator and startup configuration must run before the first
+/// allocation.
+#[cfg(feature = "allocator-jemalloc")]
+pub fn configure_with_default(default: Allocator) -> anyhow::Result<()> {
+	use tikv_jemalloc_ctl::raw;
+
+	if env::selected_allocator(default) != AllocatorSelection::Jemalloc {
+		return Ok(());
+	}
+
+	let prof_enabled: bool = unsafe { raw::read(b"opt.prof\0") }?;
+	if !prof_enabled {
+		anyhow::bail!(
+			"jemalloc profiling is unavailable; configure jemalloc with prof:true before allocator initialization"
+		);
+	}
+
+	let sample_rate = env_pprof_sample_rate(DEFAULT_PPROF_SAMPLE_RATE);
+	let active = env::selected_pprof_backend() == PprofBackend::Native && sample_rate != 0;
+	if let Some(lg_sample) = jemalloc_lg_prof_sample(sample_rate) {
+		unsafe { raw::write(b"prof.reset\0", lg_sample) }?;
+	}
+	unsafe { raw::write(b"prof.active\0", active) }?;
+	Ok(())
+}
+
+#[cfg(not(feature = "allocator-jemalloc"))]
+pub fn configure() -> anyhow::Result<()> {
+	Ok(())
+}
+
+#[cfg(not(feature = "allocator-jemalloc"))]
+pub fn configure_with_default(_default: Allocator) -> anyhow::Result<()> {
+	Ok(())
+}
+
+/// Generate a pprof heap profile from jemalloc's native heap profiler.
+///
+/// This requires the `allocator-jemalloc` feature, a jemalloc build
+/// with profiling support, and jemalloc runtime configuration such as
+/// `prof:true` and `prof_active:true`.
+#[cfg(feature = "allocator-jemalloc")]
+pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
+	use std::ffi::CString;
+	use std::fs::File;
+	use std::io::{BufReader, Read, Seek, SeekFrom};
+	use std::os::fd::{FromRawFd, RawFd};
+
+	use anyhow::Context;
+	use tikv_jemalloc_ctl::raw;
+
+	let prof_enabled: bool = unsafe { raw::read(b"opt.prof\0") }?;
+	if !prof_enabled {
+		anyhow::bail!(
+			"jemalloc native profiling is unavailable; enable jemalloc profiling with prof:true"
+		);
+	}
+
+	let prof_active: bool = unsafe { raw::read(b"prof.active\0") }?;
+	if !prof_active {
+		anyhow::bail!(
+			"jemalloc native profiling is inactive; enable prof_active:true or activate it before dumping"
+		);
+	}
+
+	let fd = unsafe {
+		libc::syscall(
+			libc::SYS_memfd_create,
+			c"pprof-alloc-jemalloc-profile".as_ptr(),
+			libc::MFD_CLOEXEC,
+		)
+	};
+	if fd < 0 {
+		return Err(std::io::Error::last_os_error())
+			.context("failed to create memfd for jemalloc profile dump");
+	}
+
+	let mut file = unsafe { File::from_raw_fd(fd as RawFd) };
+	let path = CString::new(format!("/proc/self/fd/{fd}"))?;
+
+	unsafe {
+		raw::write(b"prof.dump\0", path.as_ptr())?;
+	}
+
+	file.seek(SeekFrom::Start(0))?;
+	let mut dump = Vec::new();
+	file.read_to_end(&mut dump)?;
+
+	let mappings = crate::pprof::MAPPINGS
+		.as_deref()
+		.map(|mappings| mappings.to_vec())
+		.unwrap_or_default();
+	let profile =
+		crate::pprof::parse_jemalloc_heap_profile(BufReader::new(dump.as_slice()), mappings)?;
+	Ok(profile.to_pprof_with_period(
+		&[
+			("alloc_objects", "count"),
+			("alloc_space", "bytes"),
+			("inuse_objects", "count"),
+			("inuse_space", "bytes"),
+		],
+		("space", "bytes"),
+		0,
+		None,
+	))
+}
+
+#[cfg(feature = "allocator-jemalloc")]
+fn jemalloc_lg_prof_sample(sample_rate: usize) -> Option<libc::size_t> {
+	if sample_rate == 0 {
+		return None;
+	}
+
+	let lg_sample = usize::BITS - (sample_rate - 1).leading_zeros();
+	Some(lg_sample.min(63) as libc::size_t)
+}
+
+/// Generate a pprof heap profile from jemalloc's native heap profiler.
+#[cfg(not(feature = "allocator-jemalloc"))]
+pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
+	anyhow::bail!(
+		"jemalloc native profiling support is not compiled in; enable the `allocator-jemalloc` feature"
+	)
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __pprof_alloc_register_allocator_kind {
@@ -850,8 +1159,7 @@ fn reset_tracking_state() {
 	GLOBAL_STATS.frees.store(0, Ordering::Relaxed);
 	let _ = LOCAL_STATS.try_with(|stats| stats.reset());
 	CURRENT_PPROF_SAMPLE_RATE.store(1, Ordering::Relaxed);
-	ENV_PPROF_SAMPLE_RATE_STATE.store(ENV_SAMPLE_RATE_UNINITIALIZED, Ordering::Relaxed);
-	ENV_PPROF_SAMPLE_RATE_VALUE.store(DEFAULT_PPROF_SAMPLE_RATE, Ordering::Relaxed);
+	env::reset_for_tests();
 	let _ = NEXT_SAMPLE.try_with(|next_sample| next_sample.set(i64::MIN));
 	let _ = NEXT_SAMPLE_RATE.try_with(|next_sample_rate| next_sample_rate.set(usize::MAX));
 }
@@ -913,6 +1221,43 @@ mod tests {
 
 		assert_eq!(count, 1);
 		assert!((1180..=1190).contains(&size));
+	}
+
+	#[test]
+	#[cfg(feature = "allocator-jemalloc")]
+	fn pprof_backend_env_can_select_wrapper_backend() {
+		let _guard = TEST_GUARD.lock();
+		reset_tracking_state();
+
+		unsafe {
+			std::env::set_var(ALLOCATOR_ENV, "jemalloc");
+			std::env::set_var(PPROF_BACKEND_ENV, "wrapper");
+		}
+		env::reset_allocator_for_tests();
+		env::reset_pprof_backend_for_tests();
+		assert!(!PprofAlloc::new().native_pprof_selected());
+
+		unsafe {
+			std::env::remove_var(PPROF_BACKEND_ENV);
+		}
+		env::reset_allocator_for_tests();
+		env::reset_pprof_backend_for_tests();
+		assert!(PprofAlloc::new().native_pprof_selected());
+
+		unsafe {
+			std::env::remove_var(ALLOCATOR_ENV);
+		}
+		reset_tracking_state();
+	}
+
+	#[test]
+	#[cfg(feature = "allocator-jemalloc")]
+	fn jemalloc_sample_rate_converts_to_log2_period() {
+		assert_eq!(jemalloc_lg_prof_sample(0), None);
+		assert_eq!(jemalloc_lg_prof_sample(1), Some(0));
+		assert_eq!(jemalloc_lg_prof_sample(2), Some(1));
+		assert_eq!(jemalloc_lg_prof_sample(3), Some(2));
+		assert_eq!(jemalloc_lg_prof_sample(DEFAULT_PPROF_SAMPLE_RATE), Some(19));
 	}
 
 	#[test]
