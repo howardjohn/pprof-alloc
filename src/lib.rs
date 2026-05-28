@@ -1035,6 +1035,9 @@ pub fn configure_with_default(default: Allocator) -> anyhow::Result<()> {
 	if env::selected_allocator(default) != AllocatorSelection::Jemalloc {
 		return Ok(());
 	}
+	if !native_jemalloc_profiling_supported() {
+		return Ok(());
+	}
 
 	let prof_enabled: bool = unsafe { raw::read(b"opt.prof\0") }?;
 	if !prof_enabled {
@@ -1076,6 +1079,10 @@ pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
 
 	use anyhow::Context;
 	use tikv_jemalloc_ctl::raw;
+
+	if !native_jemalloc_profiling_supported() {
+		anyhow::bail!("jemalloc native profiling is disabled on musl builds");
+	}
 
 	let prof_enabled: bool = unsafe { raw::read(b"opt.prof\0") }?;
 	if !prof_enabled {
@@ -1131,6 +1138,16 @@ pub fn generate_jemalloc_pprof() -> anyhow::Result<Vec<u8>> {
 		parsed.sampling_rate,
 		None,
 	))
+}
+
+#[cfg(all(feature = "allocator-jemalloc", target_env = "musl"))]
+const fn native_jemalloc_profiling_supported() -> bool {
+	false
+}
+
+#[cfg(all(feature = "allocator-jemalloc", not(target_env = "musl")))]
+const fn native_jemalloc_profiling_supported() -> bool {
+	true
 }
 
 #[cfg(feature = "allocator-jemalloc")]
@@ -1315,6 +1332,18 @@ mod tests {
 		assert_eq!(jemalloc_lg_prof_sample(2), Some(1));
 		assert_eq!(jemalloc_lg_prof_sample(3), Some(2));
 		assert_eq!(jemalloc_lg_prof_sample(DEFAULT_PPROF_SAMPLE_RATE), Some(19));
+	}
+
+	#[test]
+	#[cfg(all(feature = "allocator-jemalloc", target_env = "musl"))]
+	fn native_jemalloc_profiling_is_disabled_on_musl() {
+		assert!(!native_jemalloc_profiling_supported());
+		assert!(
+			generate_jemalloc_pprof()
+				.unwrap_err()
+				.to_string()
+				.contains("disabled on musl")
+		);
 	}
 
 	#[test]

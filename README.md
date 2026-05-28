@@ -135,6 +135,9 @@ values fall back to the default passed to `with_pprof_sample_rate_from_env`. For
 native jemalloc profiling, `configure()` reads the same env var during startup,
 rounds it up to jemalloc's nearest power-of-two sample period, and applies it
 with `prof.reset`. A value of `0` leaves native profiling inactive.
+On musl builds, native jemalloc profiling is treated as unavailable and is not
+activated; use `PPROF_ALLOC_BACKEND=wrapper` if stack-attributed profiles are
+needed there.
 
 Set `PPROF_ALLOC_ALLOCATOR=system`, `PPROF_ALLOC_ALLOCATOR=jemalloc`, or
 `PPROF_ALLOC_ALLOCATOR=mimalloc` before startup. `ALLOCATOR` is also accepted as
