@@ -272,49 +272,49 @@ impl Collector for PrometheusCollector {
 		encode_counter(
 			&mut encoder,
 			s.pgfault,
-			"cgroup_pgfault_total",
+			"cgroup_pgfault",
 			"cgroup page faults",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.pgmajfault,
-			"cgroup_pgmajfault_total",
+			"cgroup_pgmajfault",
 			"cgroup major page faults",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_refault_anon,
-			"cgroup_workingset_refault_anon_total",
+			"cgroup_workingset_refault_anon",
 			"anonymous workingset refaults",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_refault_file,
-			"cgroup_workingset_refault_file_total",
+			"cgroup_workingset_refault_file",
 			"file workingset refaults",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_activate_anon,
-			"cgroup_workingset_activate_anon_total",
+			"cgroup_workingset_activate_anon",
 			"anonymous workingset activations",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_activate_file,
-			"cgroup_workingset_activate_file_total",
+			"cgroup_workingset_activate_file",
 			"file workingset activations",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_restore_anon,
-			"cgroup_workingset_restore_anon_total",
+			"cgroup_workingset_restore_anon",
 			"anonymous workingset restores",
 		)?;
 		encode_counter(
 			&mut encoder,
 			s.workingset_restore_file,
-			"cgroup_workingset_restore_file_total",
+			"cgroup_workingset_restore_file",
 			"file workingset restores",
 		)?;
 		Ok(())
